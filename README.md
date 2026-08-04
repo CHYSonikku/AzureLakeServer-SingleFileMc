@@ -16,7 +16,6 @@
 - [技术架构](#技术架构)
 - [构建](#构建)
 - [目录结构](#目录结构)
-- [阶段文档索引](#阶段文档索引omodoosphasemd)
 - [已知限制与设计取舍](#已知限制与设计取舍)
 - [许可证](#许可证)
 
@@ -54,7 +53,8 @@ zip 容器里。运行时不做任何解压：宿主通过 mmap 直接把 exe �
 - `artifacts\game\`：gameDir（真实、可写、持久）。`saves\` 存档、`mods\`、
   `config\`、`resourcepacks\` 都在这。**mods 放 `artifacts\game\mods\` 即可加载。**
 - `artifacts\logs\`：游戏日志。
-- `artifacts\game\cache\natives\`：JVM natives 临时提取目录，退出时清理。
+- natives 虚拟化：JVM natives 全部位于虚拟 `Z:\cache\natives\`（内存，不落盘），
+  真实 `artifacts\game\cache` 零 natives。
 
 ### 调试环境变量
 
@@ -75,11 +75,12 @@ zip 容器里。运行时不做任何解压：宿主通过 mmap 直接把 exe �
    │                             Store 校验，建虚拟目录表（不落盘）
    ├─ 2. JIT-safety 预热          在第一个 detour 安装前编译全部热路径
    │                             （回退/启动链/PE 镜像布局/JNI delegate）
-   ├─ 3. FakeFileSystem.Init()   安装 16 个 ntdll hook（MinHook.NET 原生 detour）
+   ├─ 3. FakeFileSystem.Init()   安装 19 个 ntdll hook（MinHook.NET 原生 detour）
    ├─ 4. JNI_CreateJavaVM        进程内创建 JVM；jvm.dll 优先真实磁盘加载，
    │                             缺失时经假 SEC_IMAGE 从容器内存加载
-   └─ 5. McLaunch.Run()          解析版本 json → 构建 Z:\ 类路径 → 提取 natives →
-                                 gameDir 就绪 → Client.main(String[]) → 等待主菜单
+   └─ 5. McLaunch.Run()          解析版本 json → 构建 Z:\ 类路径 → natives 虚拟化到
+                                 Z:\cache\natives → gameDir 就绪 → Client.main(String[])
+                                 → 等待主菜单
 ```
 
 ### 尾部 zip 容器（`Container.cs`）
@@ -95,7 +96,7 @@ zip 容器里。运行时不做任何解压：宿主通过 mmap 直接把 exe �
 
 ### ntdll hook 虚拟文件系统（`FakeFileSystem.cs` + `native_hooks/`）
 
-16 个 hook，分四组：
+19 个 hook，分五组：
 
 | 组 | Hook |
 |---|---|
@@ -103,13 +104,19 @@ zip 容器里。运行时不做任何解压：宿主通过 mmap 直接把 exe �
 | 映射 | `NtCreateSection` `NtMapViewOfSection` `NtUnmapViewOfSection` `NtQuerySection` |
 | 目录枚举 | `NtQueryDirectoryFile` `NtQueryDirectoryFileEx` |
 | 句柄 | `NtDuplicateObject` |
+| 写入与锁 | `NtWriteFile` `NtLockFile` `NtUnlockFile` |
+
+（`NtDuplicateObject` 保留在句柄组；写入与锁组为 PHASE18 新增，服务虚拟 natives 区。）
 
 关键机制：
 
 - **`Z:\` 虚拟根**：JVM 与游戏的路径访问被改写到 `Z:\openjdk\...`、`Z:\minecraft\...`，
   由容器条目表直接服务；无容器时回退 exe 旁的磁盘别名（仅调试用）。
-- **假句柄表**：`NtCreateFile`/`NtOpenFile` 对容器内文件返回伪造句柄
+- **假句柄表**：`NtCreateFile`/`NtOpenFile` 对容器内文件与虚拟 natives 文件返回伪造句柄
   （文件 `0x5100xxxx`、section `0x52000000|n`），真实句柄一律放行到原 trampoline。
+- **虚拟可写区（PHASE18）**：仅 `Z:\cache\natives\` 子树可写，natives 提取与运行期
+  JNA/LWJGL/Netty 写入全走内存虚拟文件表（经 `NtWriteFile` hook），其余 `Z:\` 保持只读；
+  可写句柄拒读、只读句柄拒写（句柄级 + 文件级互斥）。
 - **假 `SEC_IMAGE`**：`NtCreateSection` / `NtMapViewOfSection` 对容器内 PE 文件
   （如 `jvm.dll`）做纯托管 PE32+ 解析 + 手工镜像布局，内存里按节加载，不落盘。
 - **JNI 进程内 JVM**：加载 `jvm.dll` → `JNI_CreateJavaVM` → 在宿主进程内直接跑
@@ -207,8 +214,8 @@ SingleFileMc/
 ├─ SingleFileMc/                 # 宿主主工程（net10.0 / NativeAOT）
 │  ├─ Program.cs                 # 入口：容器 Init -> 预热 -> hook 安装 -> JNI -> MC 启动
 │  ├─ Container.cs               # 尾部 zip 容器：mmap + EOCD + 手动解析 + Store 校验
-│  ├─ FakeFileSystem.cs          # ntdll hook VFS：Z:\ + 假句柄 + 假 SEC_IMAGE + 16 hooks
-│  ├─ McLaunch.cs                # 启动链：版本 json -> 类路径 -> natives -> Client.main
+│  ├─ FakeFileSystem.cs          # ntdll hook VFS：Z:\ + 假句柄 + 假 SEC_IMAGE + 19 hooks
+│  ├─ McLaunch.cs                # 启动链：版本 json -> 类路径 -> natives 虚拟化 -> Client.main
 │  ├─ Minecraft/                 # 游戏数据树（打包进容器；.minecraft/ 与 jdk-25.0.4.7-hotspot/）
 │  └─ TestFS/                    # VFS 相关测试
 ├─ native_hooks/                 # C 守卫 stub 库（CMake）
@@ -227,35 +234,17 @@ SingleFileMc/
 
 ---
 
-## 阶段文档索引（.omo/docs/PHASE*.md）
-
-完整演进记录，按需查阅：
-
-| 文档 | 主题 |
-|---|---|
-| `PHASE1.md` | 立项与总体设计 |
-| `PHASE3-NATIVE.md` | native 守卫 stub 库 / MinHook 接入 |
-| `PHASE4-NOGC.md` | 无 GC 干扰 / JIT-safety 预热 |
-| `PHASE7-CLEAN.md` | 清理与基线化 |
-| `PHASE9-REGISTRY.md` | 注册表 / watchdog 恢复 |
-| `PHASE10-CONTAINER.md` | 尾部 zip 容器（mmap + EOCD + Store） |
-| `PHASE11-AOT.md` | NativeAOT 单文件发布路径 |
-| `PHASE12-KERNELBASE.md` | kernelbase / 句柄表加固 |
-| `PHASE13-VFSLAYER.md` | 容器虚拟分层（openjdk/ + minecraft/） |
-| `PHASE14-ZERODISK.md` | 零磁盘落地 |
-| `PHASE15-ZERODISK-FIX.md` | 零残留修复（natives 缓存到 gameDir） |
-| `PHASE16-ZERODISK-FINAL.md` | 第 16 个 hook（NtDuplicateObject）等收尾 |
-| `PHASE17-AOT-FINAL.md` | AOT 交付管线完成（Publish 落地，最终交付物验证） |
-
----
-
 ## 已知限制与设计取舍
 
 - **gameDir 是真实目录**：存档/配置持久保存是特性；但**容器内打包的 mods 不会自动进入
   gameDir**，要装 mod 请直接放进 `artifacts\game\mods\`。
-- **natives 走临时提取**：JVM natives（`-Djava.library.path` 等）提取到
-  `game\cache\natives`，退出时清理（占用文件删不掉时残留于 gameDir 内，下次启动兜底清理）。
-  这是 G2 可接受态；完整内存化随 natives 虚拟化任务推进。`%TEMP%` 已做到零残留。
+- **natives 已完全虚拟化**（PHASE18）：natives 提取与运行期 JNA/LWJGL/Netty 写入全走虚拟
+  `Z:\cache\natives\` 内存区（提取直写 + 运行期经 `NtWriteFile` hook；LoadLibrary 从虚拟区
+  经假 SEC_IMAGE 加载），真实 `game\cache` 零 natives、`%TEMP%` 零残留。仅该子树可写，
+  其余 `Z:\` 只读；可写句柄拒读、只读句柄拒写（句柄级 + 文件级互斥）。
+- **JNA `File.createTempFile` 在虚拟区不可用**（PHASE18 已知限制）：MS JDK 25 的临时文件
+  创建链绕过部分 detour，仅造成 SystemReport/OSHI 路径的 log4j WARN（装饰性，非致命），
+  游戏照常启动到主菜单。
 - **离线单机**：Realms 登录、微软账号、多人联机登录均不可用；离线身份由 exe 文件名决定。
 - **watchdog 当前被注释**（`McLaunch.cs` 中 `t.Start()` 被注释）：处于手动测试模式，
   进程持续到玩家关闭游戏窗口，之后以退出码 **3** 结束；窗口检测 / 超时路径（0 / 42）
