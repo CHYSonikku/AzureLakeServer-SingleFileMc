@@ -111,6 +111,16 @@ internal static partial class FakeFileSystem
     [ThreadStatic]
     private static int _suppressHooks;
 
+    // ---- PHASE17: hook 日志降噪开关 ----
+    // 默认关闭: hook 热路径 per-call 日志 (FAKE/NOT_FOUND 等) 只在 VerboseHooks=true 时打印,
+    // 关键事件 ([hooks]/[jit-safety]/[prejit]/[shutdown]) 与错误路径 (INVALID_INFO_CLASS/
+    // threw/EXCEPTION/failed/BUFFER_OVERFLOW/parse FAILED) 始终打印。置位: Init() 开头读
+    // 环境变量 SFMC_VERBOSE_HOOKS (=1/true 开启), 早于任何 detour 生效 —— 热路径检查是
+    // 纯字段读 + 分支, 零分配零锁, 不触发 JIT (AOT 模式编译期常量折叠)。
+    private static bool s_verboseHooks;
+
+    private static bool VerboseHooks => s_verboseHooks;
+
     // ---- x64 struct layouts (phnt) ----
     [StructLayout(LayoutKind.Sequential)]
     internal unsafe struct UNICODE_STRING
@@ -245,7 +255,7 @@ internal static partial class FakeFileSystem
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             byte[] data = Container.ReadAllBytes(key);
             File.WriteAllBytes(path, data);
-            Log($"[CreateFileW] materialized conf: {key} -> {path} ({data.Length} B)");
+            if (VerboseHooks) { Log($"[CreateFileW] materialized conf: {key} -> {path} ({data.Length} B)"); }
         }
         ConfMaterialized[key] = path;
         return path;
@@ -539,6 +549,10 @@ internal static partial class FakeFileSystem
     {
         if (_origNtCreateFile != null) { return; } // already initialized
 
+        // PHASE17: hook 日志降噪 —— 在任何 detour 生效前读取 verbose 开关 (幂等, 重复 Init 不重读)。
+        s_verboseHooks = string.Equals(Environment.GetEnvironmentVariable("SFMC_VERBOSE_HOOKS"),
+            "1", StringComparison.OrdinalIgnoreCase);
+
         DebugHelpers.AssertLayouts();
 
         // JIT safety part 3: compile every hook method to its final form BEFORE installing any
@@ -755,7 +769,7 @@ internal static partial class FakeFileSystem
             string? s = lpFileName is null ? null : new string(lpFileName);
             if (s != null && s.Contains("java.security", StringComparison.OrdinalIgnoreCase))
             {
-                Log($"[CreateFileW] PROBE java.security '{s}' suppress={_suppressHooks}");
+                if (VerboseHooks) { Log($"[CreateFileW] PROBE java.security '{s}' suppress={_suppressHooks}"); }
             }
             string? rest = StripZPrefix(s);
             if (rest is not null)
@@ -783,9 +797,9 @@ internal static partial class FakeFileSystem
                     }
                     finally { _suppressHooks++; }
                 }
-                Log($"[CreateFileW] Z: direct open (bypass) '{s}' rest='{rest}' mapHit={mapHit}"
+                if (VerboseHooks) { Log($"[CreateFileW] Z: direct open (bypass) '{s}' rest='{rest}' mapHit={mapHit}"
                     + (mapHit ? $" key='{key}' isDir={isDir} modules={(ModulesRealPath is null ? "NULL" : "set")}" : "")
-                    + $" access=0x{dwDesiredAccess:X} flags=0x{dwFlagsAndAttributes:X} disp={dwCreationDisposition}");
+                    + $" access=0x{dwDesiredAccess:X} flags=0x{dwFlagsAndAttributes:X} disp={dwCreationDisposition}"); }
             }
             return _origCreateFileW!(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
                 dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
@@ -1269,19 +1283,19 @@ internal static partial class FakeFileSystem
                         fileHandle = h;
                         if (isDir)
                         {
-                            Log($"[NtCreateFile] FAKE DIR handle=0x{h:X} '{name}' -> '{real}'");
+                            if (VerboseHooks) { Log($"[NtCreateFile] FAKE DIR handle=0x{h:X} '{name}' -> '{real}'"); }
                         }
                         else
                         {
-                            Log($"[NtCreateFile] FAKE handle=0x{h:X} '{name}' -> '{real}' ({buf!.Length} B)");
+                            if (VerboseHooks) { Log($"[NtCreateFile] FAKE handle=0x{h:X} '{name}' -> '{real}' ({buf!.Length} B)"); }
                         }
                         return 0;
                     }
-                    Log($"[NtCreateFile] Z: missing '{name}' -> STATUS_OBJECT_NAME_NOT_FOUND");
+                    if (VerboseHooks) { Log($"[NtCreateFile] Z: missing '{name}' -> STATUS_OBJECT_NAME_NOT_FOUND"); }
                     ioStatus.Status = new IntPtr(STATUS_OBJECT_NAME_NOT_FOUND);
                     return STATUS_OBJECT_NAME_NOT_FOUND;
                 }
-                Log($"[NtCreateFile] Z: missing '{name}' -> STATUS_OBJECT_NAME_NOT_FOUND");
+                if (VerboseHooks) { Log($"[NtCreateFile] Z: missing '{name}' -> STATUS_OBJECT_NAME_NOT_FOUND"); }
                 ioStatus.Status = new IntPtr(STATUS_OBJECT_NAME_NOT_FOUND);
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
@@ -1323,16 +1337,16 @@ internal static partial class FakeFileSystem
                         fileHandle = h;
                         if (isDir)
                         {
-                            Log($"[NtOpenFile] FAKE DIR handle=0x{h:X} '{name}' -> '{real}'");
+                            if (VerboseHooks) { Log($"[NtOpenFile] FAKE DIR handle=0x{h:X} '{name}' -> '{real}'"); }
                         }
                         else
                         {
-                            Log($"[NtOpenFile] FAKE handle=0x{h:X} '{name}' -> '{real}' ({buf!.Length} B)");
+                            if (VerboseHooks) { Log($"[NtOpenFile] FAKE handle=0x{h:X} '{name}' -> '{real}' ({buf!.Length} B)"); }
                         }
                         return 0;
                     }
                 }
-                Log($"[NtOpenFile] Z: {(real is not null ? "directory" : "missing")} '{name}' -> STATUS_OBJECT_NAME_NOT_FOUND");
+                if (VerboseHooks) { Log($"[NtOpenFile] Z: {(real is not null ? "directory" : "missing")} '{name}' -> STATUS_OBJECT_NAME_NOT_FOUND"); }
                 ioStatus.Status = new IntPtr(STATUS_OBJECT_NAME_NOT_FOUND);
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
@@ -1374,7 +1388,7 @@ internal static partial class FakeFileSystem
                 {
                     ioStatus.Status = IntPtr.Zero;      // EOF: success, 0 bytes -> caller sees EOF
                     ioStatus.Information = IntPtr.Zero;
-                    Log($"[NtReadFile] FAKE 0x{fileHandle:X} EOF at {offset} ({f.Name})");
+                    if (VerboseHooks) { Log($"[NtReadFile] FAKE 0x{fileHandle:X} EOF at {offset} ({f.Name})"); }
                     return 0;
                 }
 
@@ -1394,7 +1408,7 @@ internal static partial class FakeFileSystem
                 f.ReadCount++;
                 if (f.ReadCount <= 2 || f.ReadCount % 10000 == 0)
                 {
-                    Log($"[NtReadFile] FAKE 0x{fileHandle:X} off={offset} len={length} -> {n} B ({f.Name})");
+                    if (VerboseHooks) { Log($"[NtReadFile] FAKE 0x{fileHandle:X} off={offset} len={length} -> {n} B ({f.Name})"); }
                 }
                 return 0;
             }
@@ -1442,7 +1456,7 @@ internal static partial class FakeFileSystem
                     ReleaseBuffer(f.Buf);
                 }
                 targetHandle = h;
-                Log($"[NtDuplicateObject] FAKE 0x{sourceHandle:X} -> 0x{h:X} ({f.Name}) opts=0x{options:X}");
+                if (VerboseHooks) { Log($"[NtDuplicateObject] FAKE 0x{sourceHandle:X} -> 0x{h:X} ({f.Name}) opts=0x{options:X}"); }
                 return 0;
             }
             return _origNtDuplicateObject!(sourceProcessHandle, sourceHandle, targetProcessHandle,
@@ -1461,7 +1475,7 @@ internal static partial class FakeFileSystem
             if (FakeHandles.TryRemove(handle, out FakeFile? f))
             {
                 ReleaseBuffer(f.Buf);
-                Log($"[NtClose] FAKE 0x{handle:X} removed ({f.Name})");
+                if (VerboseHooks) { Log($"[NtClose] FAKE 0x{handle:X} removed ({f.Name})"); }
                 return 0;
             }
             if (FakeSections.TryRemove(handle, out FakeSection? s))
@@ -1471,7 +1485,7 @@ internal static partial class FakeFileSystem
                 int st = s.IsImage ? 0 : _origNtClose!(handle);
                 string kind = s.IsImage ? "FAKE-IMAGE section" : "FAKE section";
                 ReleaseBuffer(s.Buf);
-                Log($"[NtClose] {kind} 0x{handle:X} removed + real close st=0x{st:X} ({s.Name})");
+                if (VerboseHooks) { Log($"[NtClose] {kind} 0x{handle:X} removed + real close st=0x{st:X} ({s.Name})"); }
                 return 0;
             }
             return _origNtClose!(handle);
@@ -1514,7 +1528,7 @@ internal static partial class FakeFileSystem
                         Marshal.WriteInt32(fileInformation, 32, attrs);
                         ioStatus.Status = IntPtr.Zero;
                         ioStatus.Information = new IntPtr(40);
-                        Log($"[NtQueryInformationFile] FAKE 0x{fileHandle:X} FileBasicInformation ({f.Name})");
+                        if (VerboseHooks) { Log($"[NtQueryInformationFile] FAKE 0x{fileHandle:X} FileBasicInformation ({f.Name})"); }
                         return 0;
                     case FileStandardInformation:
                         // FILE_STANDARD_INFORMATION (24 B): AllocationSize@0, EndOfFile@8, NumberOfLinks@16(u32),
@@ -1525,7 +1539,7 @@ internal static partial class FakeFileSystem
                         Marshal.WriteByte(fileInformation, 21, f.IsDir ? (byte)1 : (byte)0);
                         ioStatus.Status = IntPtr.Zero;
                         ioStatus.Information = new IntPtr(24);
-                        Log($"[NtQueryInformationFile] FAKE 0x{fileHandle:X} FileStandardInformation -> {sz} B ({f.Name})");
+                        if (VerboseHooks) { Log($"[NtQueryInformationFile] FAKE 0x{fileHandle:X} FileStandardInformation -> {sz} B ({f.Name})"); }
                         return 0;
                     case FileInternalInformation:
                         // FILE_INTERNAL_INFORMATION (8 B): index number (0 is fine)
@@ -1539,7 +1553,7 @@ internal static partial class FakeFileSystem
                         Marshal.WriteInt64(fileInformation, 0, f.Pos);
                         ioStatus.Status = IntPtr.Zero;
                         ioStatus.Information = new IntPtr(8);
-                        Log($"[NtQueryInformationFile] FAKE 0x{fileHandle:X} FilePositionInformation -> pos={f.Pos} ({f.Name})");
+                        if (VerboseHooks) { Log($"[NtQueryInformationFile] FAKE 0x{fileHandle:X} FilePositionInformation -> pos={f.Pos} ({f.Name})"); }
                         return 0;
                     case FileAllInformation:
                         // FILE_ALL_INFORMATION: Basic@0(40) + Standard@40(24) + Internal@64(8) +
@@ -1553,7 +1567,7 @@ internal static partial class FakeFileSystem
                         Marshal.WriteInt64(fileInformation, 80, f.Pos);        // Position.CurrentByteOffset
                         ioStatus.Status = IntPtr.Zero;
                         ioStatus.Information = new IntPtr(96);
-                        Log($"[NtQueryInformationFile] FAKE 0x{fileHandle:X} FileAllInformation -> {sz} B ({f.Name})");
+                        if (VerboseHooks) { Log($"[NtQueryInformationFile] FAKE 0x{fileHandle:X} FileAllInformation -> {sz} B ({f.Name})"); }
                         return 0;
                     case FileAttributeTagInformation:
                         // FILE_ATTRIBUTE_TAG_INFORMATION (8 B): FileAttributes@0, ReparseTag@4
@@ -1596,10 +1610,10 @@ internal static partial class FakeFileSystem
                     bool isDir = ResolveIsDir(real);
                     for (int i = 0; i < 40; i++) Marshal.WriteByte(fileInformation, i, 0);
                     if (isDir) { Marshal.WriteInt32(fileInformation, 36, 0x10); }
-                    Log($"[NtQueryAttributesFile] FAKE {(isDir ? "dir" : "exists")} '{name}' -> '{real}'");
+                    if (VerboseHooks) { Log($"[NtQueryAttributesFile] FAKE {(isDir ? "dir" : "exists")} '{name}' -> '{real}'"); }
                     return 0;
                 }
-                Log($"[NtQueryAttributesFile] Z: missing '{name}' -> STATUS_OBJECT_NAME_NOT_FOUND");
+                if (VerboseHooks) { Log($"[NtQueryAttributesFile] Z: missing '{name}' -> STATUS_OBJECT_NAME_NOT_FOUND"); }
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
             return _origNtQueryAttributesFile!(ref objAttr, fileInformation);
@@ -1633,10 +1647,10 @@ internal static partial class FakeFileSystem
                     Marshal.WriteInt64(fileInformation, 32, sz); // AllocationSize
                     Marshal.WriteInt64(fileInformation, 40, sz); // EndOfFile
                     if (isDir) { Marshal.WriteInt32(fileInformation, 48, 0x10); } // FILE_ATTRIBUTE_DIRECTORY
-                    Log($"[NtQueryFullAttributesFile] FAKE {(isDir ? "dir" : "exists")} '{name}' -> '{real}' ({sz} B)");
+                    if (VerboseHooks) { Log($"[NtQueryFullAttributesFile] FAKE {(isDir ? "dir" : "exists")} '{name}' -> '{real}' ({sz} B)"); }
                     return 0;
                 }
-                Log($"[NtQueryFullAttributesFile] Z: missing '{name}' -> STATUS_OBJECT_NAME_NOT_FOUND");
+                if (VerboseHooks) { Log($"[NtQueryFullAttributesFile] Z: missing '{name}' -> STATUS_OBJECT_NAME_NOT_FOUND"); }
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
             return _origNtQueryFullAttributesFile!(ref objAttr, fileInformation);
@@ -1683,7 +1697,7 @@ internal static partial class FakeFileSystem
                 }
                 ioStatus.Status = IntPtr.Zero;
                 ioStatus.Information = new IntPtr(size);
-                Log($"[NtQueryVolumeInformationFile] FAKE 0x{fileHandle:X} class={fsInformationClass} -> ok ({f.Name})");
+                if (VerboseHooks) { Log($"[NtQueryVolumeInformationFile] FAKE 0x{fileHandle:X} class={fsInformationClass} -> ok ({f.Name})"); }
                 return 0;
             }
             return _origNtQueryVolumeInformationFile!(fileHandle, out ioStatus, fsInformation, length, fsInformationClass);
@@ -1716,7 +1730,7 @@ internal static partial class FakeFileSystem
                     f.Pos = (int)Math.Min(Math.Max(pos, 0), int.MaxValue);
                     ioStatus.Status = IntPtr.Zero;
                     ioStatus.Information = new IntPtr(8);
-                    Log($"[NtSetInformationFile] FAKE 0x{fileHandle:X} FilePositionInformation -> pos={f.Pos} ({f.Name})");
+                    if (VerboseHooks) { Log($"[NtSetInformationFile] FAKE 0x{fileHandle:X} FilePositionInformation -> pos={f.Pos} ({f.Name})"); }
                     return 0;
                 }
                 Log($"[NtSetInformationFile] FAKE 0x{fileHandle:X} class={fileInformationClass} -> STATUS_INVALID_INFO_CLASS");
@@ -1829,7 +1843,7 @@ internal static partial class FakeFileSystem
         EnsureDirEntries(f, pattern, restartScan);
         if (f.DirIndex >= f.DirEntries!.Length)
         {
-            Log($"[NtQueryDirectoryFile] FAKE 0x{fileHandle:X} class={fileInformationClass} -> NO_MORE_FILES ({f.Name})");
+            if (VerboseHooks) { Log($"[NtQueryDirectoryFile] FAKE 0x{fileHandle:X} class={fileInformationClass} -> NO_MORE_FILES ({f.Name})"); }
             ioStatus.Status = new IntPtr(STATUS_NO_MORE_FILES);
             ioStatus.Information = IntPtr.Zero;
             return STATUS_NO_MORE_FILES;
@@ -1859,7 +1873,7 @@ internal static partial class FakeFileSystem
         }
         ioStatus.Status = IntPtr.Zero;
         ioStatus.Information = new IntPtr(used);
-        Log($"[NtQueryDirectoryFile] FAKE 0x{fileHandle:X} class={fileInformationClass} -> {used} B ({f.Name})");
+        if (VerboseHooks) { Log($"[NtQueryDirectoryFile] FAKE 0x{fileHandle:X} class={fileInformationClass} -> {used} B ({f.Name})"); }
         return 0;
     }
 
@@ -2079,8 +2093,8 @@ internal static partial class FakeFileSystem
                     Interlocked.Increment(ref buf.RefCount);
                     FakeSections[h] = new FakeSection { Buf = buf, Name = f.Name, IsImage = true, Pe = pe };
                     sectionHandle = h;
-                    Log($"[NtCreateSection] FAKE-IMAGE file 0x{fileHandle:X} -> fake section=0x{h:X} "
-                        + $"(base=0x{pe.ImageBase:X} size=0x{pe.SizeOfImage:X} aep=0x{pe.AddressOfEntryPoint:X}, '{f.Name}')");
+                    if (VerboseHooks) { Log($"[NtCreateSection] FAKE-IMAGE file 0x{fileHandle:X} -> fake section=0x{h:X} "
+                        + $"(base=0x{pe.ImageBase:X} size=0x{pe.SizeOfImage:X} aep=0x{pe.AddressOfEntryPoint:X}, '{f.Name}')"); }
                     return 0;
                 }
                 // ---- REAL anonymous section (S3a deviation, see class doc) ----
@@ -2105,8 +2119,8 @@ internal static partial class FakeFileSystem
                 // handle (or the section) alone cannot free it out from under the other holder.
                 Interlocked.Increment(ref buf.RefCount);
                 FakeSections[sectionHandle] = new FakeSection { Buf = buf, Name = f.Name };
-                Log($"[NtCreateSection] FAKE file 0x{fileHandle:X} -> REAL section=0x{sectionHandle:X} "
-                    + $"({buf.Length} B, '{f.Name}') access=0x{(long)desiredAccess:X} alloc=0x{(long)allocationAttributes:X}");
+                if (VerboseHooks) { Log($"[NtCreateSection] FAKE file 0x{fileHandle:X} -> REAL section=0x{sectionHandle:X} "
+                    + $"({buf.Length} B, '{f.Name}') access=0x{(long)desiredAccess:X} alloc=0x{(long)allocationAttributes:X}"); }
                 return 0;
             }
             return _origNtCreateSection!(out sectionHandle, desiredAccess, objectAttributes, maximumSize,
@@ -2140,8 +2154,8 @@ internal static partial class FakeFileSystem
                 {
                     int st = MapImageIntoMemory(s, baseAddressPtr, viewSizePtr, sectionOffsetPtr);
                     IntPtr got = baseAddressPtr == IntPtr.Zero ? IntPtr.Zero : Marshal.ReadIntPtr(baseAddressPtr, 0);
-                    Log($"[NtMapViewOfSection] FAKE-IMAGE section=0x{sectionHandle:X} -> st=0x{st:X} "
-                        + $"want=0x{want:X} base=0x{got:X} (pe-base=0x{pe.ImageBase:X}, '{s.Name}')");
+                    if (VerboseHooks) { Log($"[NtMapViewOfSection] FAKE-IMAGE section=0x{sectionHandle:X} -> st=0x{st:X} "
+                        + $"want=0x{want:X} base=0x{got:X} (pe-base=0x{pe.ImageBase:X}, '{s.Name}')"); }
                     return st;
                 }
                 // Map the view PAGE_WRITECOPY (0x08) instead of the caller's protection: the
@@ -2187,7 +2201,7 @@ internal static partial class FakeFileSystem
                 if (viewSizePtr != IntPtr.Zero) { Marshal.WriteIntPtr(viewSizePtr, 0, new IntPtr(copyLen)); }
                 if (sectionOffsetPtr != IntPtr.Zero) { Marshal.WriteInt64(sectionOffsetPtr, 0, secOff); }
                 FakeMappedBases[dataBase] = MapKindData;
-                Log($"[NtMapViewOfSection] FAKE section=0x{sectionHandle:X} -> base=0x{dataBase:X} view={copyLen} B (off={secOff})");
+                if (VerboseHooks) { Log($"[NtMapViewOfSection] FAKE section=0x{sectionHandle:X} -> base=0x{dataBase:X} view={copyLen} B (off={secOff})"); }
                 return 0;
             }
             return _origNtMapViewOfSection!(sectionHandle, processHandle, baseAddressPtr, zeroBits, commitSize,
@@ -2212,11 +2226,11 @@ internal static partial class FakeFileSystem
                 {
                     // S2b: fake image map -> our own VirtualAlloc region, free it directly
                     VirtualFree(baseAddress, UIntPtr.Zero, MEM_RELEASE);
-                    Log($"[NtUnmapViewOfSection] FAKE-IMAGE base=0x{baseAddress:X} VirtualFree(MEM_RELEASE)");
+                    if (VerboseHooks) { Log($"[NtUnmapViewOfSection] FAKE-IMAGE base=0x{baseAddress:X} VirtualFree(MEM_RELEASE)"); }
                     return 0;
                 }
                 int st = _origNtUnmapViewOfSection!(processHandle, baseAddress);
-                Log($"[NtUnmapViewOfSection] FAKE base=0x{baseAddress:X} real unmap st=0x{st:X}");
+                if (VerboseHooks) { Log($"[NtUnmapViewOfSection] FAKE base=0x{baseAddress:X} real unmap st=0x{st:X}"); }
                 return 0;
             }
             return _origNtUnmapViewOfSection!(processHandle, baseAddress);
@@ -2257,7 +2271,7 @@ internal static partial class FakeFileSystem
                         return STATUS_INFO_LENGTH_MISMATCH;
                     }
                     FillSectionImageInfo(pe, infoBuffer);
-                    Log($"[NtQuerySection] FAKE-IMAGE 0x{sectionHandle:X} class={infoClass} -> SII 0x{SII_SIZE:X} B (pe-base=0x{pe.ImageBase:X})");
+                    if (VerboseHooks) { Log($"[NtQuerySection] FAKE-IMAGE 0x{sectionHandle:X} class={infoClass} -> SII 0x{SII_SIZE:X} B (pe-base=0x{pe.ImageBase:X})"); }
                     return 0;
                 }
                 if (infoClass == 0)
@@ -2273,10 +2287,10 @@ internal static partial class FakeFileSystem
                     for (int i = 0; i < SBI_SIZE; i++) { Marshal.WriteByte(infoBuffer, i, 0); }
                     Marshal.WriteInt32(infoBuffer, 8, (int)SEC_IMAGE);
                     Marshal.WriteInt64(infoBuffer, 16, pe.SizeOfImage);
-                    Log($"[NtQuerySection] FAKE-IMAGE 0x{sectionHandle:X} class=0 -> SBI (size=0x{pe.SizeOfImage:X})");
+                    if (VerboseHooks) { Log($"[NtQuerySection] FAKE-IMAGE 0x{sectionHandle:X} class=0 -> SBI (size=0x{pe.SizeOfImage:X})"); }
                     return 0;
                 }
-                Log($"[NtQuerySection] FAKE-IMAGE 0x{sectionHandle:X} class={infoClass} -> trampoline");
+                if (VerboseHooks) { Log($"[NtQuerySection] FAKE-IMAGE 0x{sectionHandle:X} class={infoClass} -> trampoline"); }
             }
             return _origNtQuerySection!(sectionHandle, infoClass, infoBuffer, infoLength, returnLengthPtr);
         }
@@ -2421,7 +2435,7 @@ internal static partial class FakeFileSystem
                 return STATUS_INVALID_IMAGE_BASE;
             }
         }
-        Log($"[layout] {pe.SizeOfImage:X} {pe.SizeOfHeaders:X} want=0x{want:X} base=0x{allocBase:X} len={len}");
+        if (VerboseHooks) { Log($"[layout] {pe.SizeOfImage:X} {pe.SizeOfHeaders:X} want=0x{want:X} base=0x{allocBase:X} len={len}"); }
         // headers
         int hdr = (int)Math.Min(pe.SizeOfHeaders, (uint)len);
         if (hdr > 0) { Buffer.MemoryCopy(data, (void*)allocBase, pe.SizeOfImage, hdr); }
@@ -2433,7 +2447,7 @@ internal static partial class FakeFileSystem
         int n = 0;
         foreach ((int va, int vsz, int rawsz, int rawptr) in pe.Sections)
         {
-            Log($"[layout] sec {n} va=0x{va:X} vsz=0x{vsz:X} rawsz=0x{rawsz:X} rawptr=0x{rawptr:X}");
+            if (VerboseHooks) { Log($"[layout] sec {n} va=0x{va:X} vsz=0x{vsz:X} rawsz=0x{rawsz:X} rawptr=0x{rawptr:X}"); }
             n++;
             if (va < 0 || va >= (int)pe.SizeOfImage) { continue; }
             byte* dst = (byte*)allocBase + va;
@@ -2489,7 +2503,7 @@ internal static partial class FakeFileSystem
                     }
                 }
             }
-            Log($"[layout] RELOC delta=0x{relocDelta:X} base=0x{allocBase:X} (patched ImageBase + .reloc applied)");
+            if (VerboseHooks) { Log($"[layout] RELOC delta=0x{relocDelta:X} base=0x{allocBase:X} (patched ImageBase + .reloc applied)"); }
         }
         // Write the map results back to the loader's slots. ALL THREE are explicit null-guarded
         // writes (S2b byref workaround, see D_NtMapViewOfSection doc): sectionOffset is OPTIONAL
@@ -2505,7 +2519,7 @@ internal static partial class FakeFileSystem
         // dead MapKindData entry); the latest map kind must win so NtUnmapViewOfSection chooses
         // VirtualFree (image) over the real unmap (which returns STATUS_INVALID_ADDRESS).
         FakeMappedBases[allocBase] = MapKindImage;
-        Log($"[layout] done base=0x{allocBase:X}");
+        if (VerboseHooks) { Log($"[layout] done base=0x{allocBase:X}"); }
         return 0;
     }
 
@@ -2692,7 +2706,7 @@ internal static partial class FakeFileSystem
                 NativeMemory.Free(buf.Data);
                 buf.Data = null;
             }
-            Log($"[native] freed {buf.Length} B buffer");
+            if (VerboseHooks) { Log($"[native] freed {buf.Length} B buffer"); }
             buf.Length = 0;
         }
     }

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -161,7 +162,7 @@ internal static class McLaunch
 
     private static void PrepareVars()
     {
-        Vars["${auth_player_name}"] = "Steve";
+        Vars["${auth_player_name}"] = Path.GetFileNameWithoutExtension(Process.GetCurrentProcess().ProcessName);
         Vars["${version_name}"] = VersionId;
         Vars["${game_directory}"] = GameDir;
         Vars["${assets_root}"] = AssetsDir;
@@ -544,7 +545,7 @@ internal static class McLaunch
         // 退出码 0。游戏窗口 "Minecraft NeoForge* 26.2" 出现 = 主菜单在渲染。
         var t = new Thread(() => WatchdogLoop(latest)) { IsBackground = true, Name = "mc-watchdog" };
         Console.WriteLine("[mc] starting watchdog thread, Client.main on this thread ...");
-        t.Start();
+        //t.Start();
 
         int r;
         try
