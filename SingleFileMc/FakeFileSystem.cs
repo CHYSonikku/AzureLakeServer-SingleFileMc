@@ -160,6 +160,16 @@ internal static partial class FakeFileSystem
     private const int STATUS_NO_MORE_FILES = unchecked((int)0x80000006);
     private const int STATUS_BUFFER_OVERFLOW = unchecked((int)0x80000005);
 
+    // ---- PHASE18: natives 虚拟可写区 (Z:\cache\natives\) 状态码 ----
+    private const int STATUS_ACCESS_DENIED = unchecked((int)0xC0000022);
+    private const int STATUS_SHARING_VIOLATION = unchecked((int)0xC0000043);
+    private const int STATUS_OBJECT_NAME_COLLISION = unchecked((int)0xC0000035);
+    // FILE_CREATE_DISPOSITION (phnt): 0=SUPERSEDE 1=OPEN 2=CREATE 3=OPEN_IF 4=OVERWRITE 5=OVERWRITE_IF
+    private const uint FILE_DIRECTORY_FILE = 0x1;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint FILE_WRITE_DATA = 0x2;
+    private const uint FILE_APPEND_DATA = 0x4;
+
     // ---- PHASE16: NtDuplicateObject (JDK 25 FileChannelImpl.map 复制句柄) ----
     private static readonly IntPtr NtCurrentProcess = new(-1);
     private const uint DUPLICATE_CLOSE_SOURCE = 0x1;
@@ -272,6 +282,19 @@ internal static partial class FakeFileSystem
     private delegate int D_NtReadFile(IntPtr fileHandle, IntPtr evt, IntPtr apcRoutine, IntPtr apcContext,
         out IO_STATUS_BLOCK ioStatus, IntPtr buffer, uint length, IntPtr byteOffset, IntPtr key);
 
+    // PHASE18 (第 17 个钩子): NtWriteFile —— natives 虚拟写 (签名与 NtReadFile 一致)。
+    private delegate int D_NtWriteFile(IntPtr fileHandle, IntPtr evt, IntPtr apcRoutine, IntPtr apcContext,
+        out IO_STATUS_BLOCK ioStatus, IntPtr buffer, uint length, IntPtr byteOffset, IntPtr key);
+
+    // PHASE18 (第 18 个钩子): NtLockFile —— NativeLibrariesBootstrap.tryLock
+    // (FileChannelImpl.tryLock -> FileDispatcherImpl.lock0 -> LockFile -> NtLockFile)。
+    private delegate int D_NtLockFile(IntPtr fileHandle, IntPtr evt, IntPtr apcRoutine, IntPtr apcContext,
+        out IO_STATUS_BLOCK ioStatus, IntPtr byteOffset, IntPtr length, uint key, byte failImmediately, byte exclusiveLock);
+
+    // PHASE18 (第 19 个钩子): NtUnlockFile —— FileLock.release / channel close 解锁。
+    private delegate int D_NtUnlockFile(IntPtr fileHandle, out IO_STATUS_BLOCK ioStatus,
+        IntPtr byteOffset, IntPtr length, uint key);
+
     private delegate int D_NtClose(IntPtr handle);
 
     private delegate int D_NtQueryInformationFile(IntPtr fileHandle, out IO_STATUS_BLOCK ioStatus,
@@ -331,6 +354,9 @@ internal static partial class FakeFileSystem
     private static D_NtCreateFile? _origNtCreateFile;
     private static D_NtOpenFile? _origNtOpenFile;
     private static D_NtReadFile? _origNtReadFile;
+    private static D_NtWriteFile? _origNtWriteFile;
+    private static D_NtLockFile? _origNtLockFile;
+    private static D_NtUnlockFile? _origNtUnlockFile;
     private static D_NtClose? _origNtClose;
     private static D_NtQueryInformationFile? _origNtQueryInformationFile;
     private static D_NtQueryAttributesFile? _origNtQueryAttributesFile;
@@ -353,6 +379,7 @@ internal static partial class FakeFileSystem
     {
         public byte* Data;        // NativeMemory.Alloc'ed, valid while RefCount > 0
         public int Length;
+        public int Capacity;      // PHASE18: 分配容量 (可写 natives 缓冲随写增长; 只读缓冲 == Length)
         public int RefCount;      // 1 = FakeFile owner; every sharing FakeSection adds 1
     }
 
@@ -366,6 +393,14 @@ internal static partial class FakeFileSystem
         // IsDir 假句柄; NtQueryDirectoryFile 从 Real 真实目录枚举条目 (DirEntries 缓存)。
         public bool IsDir;
         public string Real = "";
+        // PHASE18: 句柄读写模式 —— 0 = 只读句柄 (服务 NtReadFile; NtWriteFile 拒绝),
+        // 1 = 可写句柄 (服务 NtWriteFile; NtReadFile 拒绝)。带写访问打开 -> 可写, 否则只读。
+        // 不允许边读边写: 同一句柄拒绝混合 (合理错误 STATUS_ACCESS_DENIED)。
+        public int AccessMode;
+        // PHASE18: 虚拟 natives 条目引用 (读写互斥计数记账; 非虚拟文件为 null)
+        public VirtualEntry? VEntry;
+        // PHASE18: FileDispositionInformation 置位 (delete-on-close) —— 关闭时从虚拟表移除
+        public bool DeleteOnClose;
         public DirEntry[]? DirEntries;   // 已按 pattern 过滤的枚举缓存 (仅匹配项)
         public string DirPattern = "";   // 缓存对应的 pattern
         public int DirIndex;             // FindNextFileW 游标
@@ -396,6 +431,30 @@ internal static partial class FakeFileSystem
 
     private static readonly ConcurrentDictionary<IntPtr, FakeFile> FakeHandles = new();
     private static int _handleCounter;
+
+    // ---- PHASE18: natives 虚拟可写区 (Z:\cache\natives\ 子树, 内存不落盘) ----
+    // 仅该子树可写; Z:\cache\ 其余与全部非 natives 路径保持只读 (容器/磁盘语义不变)。
+    // 读写互斥: OpenReadCount/OpenWriteCount 保证"写句柄未关闭时同文件读打开"合理失败;
+    // 顺序写->闭->读 (LoadLibrary) 允许。写增长经 EnsureBufferCapacity 就地 realloc
+    // (互斥保证无读者共享, realloc 安全; hook 热路径零托管数组)。
+    /// <summary>虚拟 natives 文件条目: 权威 NativeBuffer (可增长) + 打开计数 (读写互斥)。</summary>
+    private sealed unsafe class VirtualEntry
+    {
+        public NativeBuffer Buf = new() { Data = null, Length = 0, Capacity = 0, RefCount = 1 };
+        public int OpenReadCount;   // 已打开只读句柄数 (写打开前必须为 0)
+        public int OpenWriteCount;  // 已打开可写句柄数 (读打开前必须为 0)
+    }
+
+    // 虚拟 natives 文件表: 规范化 rest 路径 ("cache\natives\java\openal32.dll") -> 条目
+    private static readonly ConcurrentDictionary<string, VirtualEntry> VirtualFiles = new(StringComparer.OrdinalIgnoreCase);
+    // 虚拟 natives 目录表 ("cache\natives\jna" 等; "cache" 与 "cache\natives" 预置)
+    private static readonly ConcurrentDictionary<string, byte> VirtualDirs = new(StringComparer.OrdinalIgnoreCase);
+
+    static FakeFileSystem()
+    {
+        VirtualDirs["cache"] = 0;
+        VirtualDirs["cache\\natives"] = 0;
+    }
 
     // ---- S3a/S2b: fake sections (handle -> shared file buffer) and fake mapped view bases ----
     /// <summary>
@@ -488,7 +547,12 @@ internal static partial class FakeFileSystem
         public IntPtr NtQueryDirectoryFileEx;
         // PHASE16: NtDuplicateObject (第 16 个钩子, JDK 25 FileChannelImpl.map 复制句柄)
         public IntPtr NtDuplicateObject;
-        // 15 个 Orig trampoline (MinHook.NET CreateHook 返回)
+        // PHASE18 (第 17 个钩子): NtWriteFile —— natives 虚拟写 (Z:\cache\natives 可写区)
+        public IntPtr NtWriteFile;
+        // PHASE18 (第 18/19 个钩子): NtLockFile/NtUnlockFile —— natives 虚拟锁 (tryLock 契约)
+        public IntPtr NtLockFile;
+        public IntPtr NtUnlockFile;
+        // 17 个 Orig trampoline (MinHook.NET CreateHook 返回)
         public IntPtr OrigNtCreateFile;
         public IntPtr OrigNtOpenFile;
         public IntPtr OrigNtReadFile;
@@ -505,6 +569,11 @@ internal static partial class FakeFileSystem
         public IntPtr OrigNtQueryDirectoryFile;
         public IntPtr OrigNtQueryDirectoryFileEx;
         public IntPtr OrigNtDuplicateObject;
+        // PHASE18 (第 17 个钩子): NtWriteFile 的 Orig trampoline
+        public IntPtr OrigNtWriteFile;
+        // PHASE18 (第 18/19 个钩子): NtLockFile/NtUnlockFile 的 Orig trampoline
+        public IntPtr OrigNtLockFile;
+        public IntPtr OrigNtUnlockFile;
     }
 
     // ---- PHASE11-AOT: native 守卫绑定 (AOT/JIT 双模式) ----
@@ -641,6 +710,22 @@ internal static partial class FakeFileSystem
         b.NtDuplicateObject = (nint)(delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr, IntPtr*, uint, uint, uint, int>)&Managed_NtDuplicateObject;
         b.OrigNtDuplicateObject = InstallNativeHook(ntdll, hHooks, "NtDuplicateObject", out _origNtDuplicateObject);
 
+        // ---- PHASE18 (第 17 个钩子): NtWriteFile —— natives 虚拟写 (Z:\cache\natives 可写区)。
+        // JVM 提取链 (JNA jna.tmpdir / LWJGL SharedLibraryExtractPath / Netty workdir) 经
+        // kernelbase WriteFile -> IAT NtWriteFile; 只服务可写 natives 假句柄 (托管侧按
+        // AccessMode 分流), 只读/目录假句柄回 STATUS_ACCESS_DENIED (合理失败), 其余放行。----
+        b.NtWriteFile = (nint)(delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr, IntPtr, IO_STATUS_BLOCK*, IntPtr, uint, IntPtr, IntPtr, int>)&Managed_NtWriteFile;
+        b.OrigNtWriteFile = InstallNativeHook(ntdll, hHooks, "NtWriteFile", out _origNtWriteFile);
+
+        // ---- PHASE18 (第 18/19 个钩子): NtLockFile/NtUnlockFile —— NativeLibrariesBootstrap
+        // tryLock 契约 (FileKey.init 已服务后, lock0 -> LockFile -> NtLockFile 必须成功;
+        // release -> UnlockFile -> NtUnlockFile)。虚拟 natives 文件授予锁 (单进程内无竞争,
+        // 跨进程不可见, 空操作即正确语义)。----
+        b.NtLockFile = (nint)(delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr, IntPtr, IO_STATUS_BLOCK*, IntPtr, IntPtr, uint, byte, byte, int>)&Managed_NtLockFile;
+        b.OrigNtLockFile = InstallNativeHook(ntdll, hHooks, "NtLockFile", out _origNtLockFile);
+        b.NtUnlockFile = (nint)(delegate* unmanaged[Stdcall]<IntPtr, IO_STATUS_BLOCK*, IntPtr, IntPtr, uint, int>)&Managed_NtUnlockFile;
+        b.OrigNtUnlockFile = InstallNativeHook(ntdll, hHooks, "NtUnlockFile", out _origNtUnlockFile);
+
         // run12: kernelbase!CreateFileW 托管 detour —— JVM 的 java.io.FileInputStream 走
         // kernelbase direct-syscall 绕过 ntdll hook; 用 MinHook 原生重载直接挂 CreateFileW
         // 导出 ([UnmanagedCallersOnly] 回调自管理 _suppressHooks, 不经 native 守卫 stub)。
@@ -660,13 +745,13 @@ internal static partial class FakeFileSystem
         {
             throw new InvalidOperationException("SetCallbacks 注册失败 (native sfmc_hooks_shared)");
         }
-        Log($"[hooks] SetCallbacks ok: 16 callbacks + 16 origs registered");
+        Log($"[hooks] SetCallbacks ok: 19 callbacks + 19 origs registered");
 
         // 修改后 MinHook.NET: CreateHook 只建 trampoline(未 patch); EnableHooks 应用全部
         // prologue patch(delegate + 原生两个映射)。安全窗口同旧版(JVM 尚不存在)。
         HookEngine.EnableHooks();
         _engineActive = true;
-        Log($"[hooks] 11 S2a + 4 S3a/S2b + 1 PHASE16 (NtDuplicateObject) native-stub detours enabled on ntdll (suppress={NativeIsSuppressHooks()})");
+        Log($"[hooks] 11 S2a + 4 S3a/S2b + 1 PHASE16 (NtDuplicateObject) + 1 PHASE18 (NtWriteFile) + 2 PHASE18 (NtLockFile/NtUnlockFile) native-stub detours enabled on ntdll (suppress={NativeIsSuppressHooks()})");
     }
 
     /// <summary>
@@ -716,6 +801,13 @@ internal static partial class FakeFileSystem
             nameof(Managed_NtQueryDirectoryFile), nameof(Managed_NtQueryDirectoryFileEx),
             nameof(Hook_NtQueryDirectoryFileEx),
             nameof(Managed_NtDuplicateObject),
+            // PHASE18 (第 17 个钩子) + 虚拟 natives 写区辅助 (钩子内首调不得触发 JIT)
+            nameof(Hook_NtWriteFile), nameof(Managed_NtWriteFile),
+            nameof(Hook_NtLockFile), nameof(Managed_NtLockFile),
+            nameof(Hook_NtUnlockFile), nameof(Managed_NtUnlockFile),
+            nameof(Hook_VirtualOpen), nameof(IsVirtualPath), nameof(IsVirtualReal), nameof(HasWriteAccess),
+            nameof(GetOrCreateVirtualEntry), nameof(CreateVirtualFile), nameof(EnsureBufferCapacity),
+            nameof(SetVirtualLength), nameof(EnsureVirtualAncestors),
             // PHASE9: 目录枚举辅助(钩子内首调不得触发 JIT)
             nameof(ServeDirectoryQuery), nameof(EnsureDirEntries), nameof(MatchesPattern),
             nameof(WildcardMatch), nameof(StatEntry), nameof(WriteDirRecord), nameof(ReadUnicodeString),
@@ -783,7 +875,10 @@ internal static partial class FakeFileSystem
                 string key = "";
                 bool isDir = false;
                 bool mapHit = Container.Active && Container.TryMapKey(rest, out key, out isDir) && !isDir;
-                if (mapHit)
+                // PHASE18: natives 虚拟区 (Z:\cache\natives\...) 同样需释放守卫, 让内层
+                // NtCreateFile hook 以虚拟假句柄服务 (否则真内核收 Z: 路径 -> 全部失败)。
+                bool nativesHit = IsVirtualPath(rest);
+                if (mapHit || nativesHit)
                 {
                     // MC 数据树 jar 等: 放行给 kernelbase, 由内层 NtCreateFile 经 ntdll hook 服务
                     // (run12 回归修复: 本回调内 [ThreadStatic] _suppressHooks>0 会遮蔽内层
@@ -886,6 +981,14 @@ internal static partial class FakeFileSystem
         Log($"[NtCreateFile] FAKE DIR handle=0x{h:X} '{s}' -> '{s}'");
         bool b = false;
         Log($"[prejit] warmup shapes: {b} {h:X} {off} {len} {n} {s}");
+        // PHASE18: NtWriteFile / 虚拟 natives 写区 log 形状
+        Log($"[NtWriteFile] FAKE 0x{h:X} off={off} len={len} -> {len} B ({s})");
+        Log($"[NtWriteFile] FAKE 0x{h:X} READ-ONLY handle denied ({s})");
+        Log($"[NtLockFile] FAKE 0x{h:X} granted ({s})");
+        Log($"[NtUnlockFile] FAKE 0x{h:X} released ({s})");
+        Log($"[NtCreateFile] FAKE VFILE 0x{h:X} '{s}' -> 'Z:\\{s}' ({n} B, mode={s})");
+        Log($"[NtCreateFile] FAKE VDIR handle=0x{h:X} '{s}' -> 'Z:\\{s}'");
+        Log($"[NtCreateFile] FAKE VFILE SHARING_VIOLATION (write open while readers) '{s}' -> 'Z:\\{s}'");
         // Phase 2: Directory.Exists + File.Exists now run inside the attribute/create hooks
         // (directory stat support for Z:\minecraft\... data paths) -- compile their internals now.
         bool wdir = Directory.Exists(@"C:\Windows");
@@ -950,6 +1053,10 @@ internal static partial class FakeFileSystem
         Log($"[shutdown] release buffers (handles={FakeHandles.Count} sections={FakeSections.Count} maps={FakeMappedBases.Count})");
         foreach (var kv in FakeHandles) { ReleaseBuffer(kv.Value.Buf); }
         foreach (var kv in FakeSections) { ReleaseBuffer(kv.Value.Buf); }
+        // PHASE18: 释放虚拟 natives 条目缓冲 (条目持 1 引用; 句柄引用已在上方释放)
+        foreach (var kv in VirtualFiles) { ReleaseBuffer(kv.Value.Buf); }
+        VirtualFiles.Clear();
+        VirtualDirs.Clear();
         // S2b: any fake IMAGE maps still alive are our own VirtualAlloc regions -> free them
         foreach (var kv in FakeMappedBases)
         {
@@ -1051,17 +1158,22 @@ internal static partial class FakeFileSystem
         return null;
     }
 
-    /// <summary>是否为容器伪路径 (TryMap 在容器命中时返回 "Z:\&lt;rest&gt;")。</summary>
+    /// <summary>是否为容器伪路径 (TryMap 在容器命中时返回 "Z:\&lt;rest&gt;"; 虚拟 natives 区除外)。</summary>
     [MethodImpl(MethodImplOptions.NoOptimization)]
     private static bool IsContainerReal(string real)
     {
-        return Container.Active && real.StartsWith(@"Z:\", StringComparison.OrdinalIgnoreCase);
+        return Container.Active && !IsVirtualReal(real) && real.StartsWith(@"Z:\", StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>解析 real 路径的目录性: 容器伪路径 -> 容器目录表; 磁盘 -> Directory.Exists。</summary>
+    /// <summary>解析 real 路径的目录性: 虚拟 natives -> 虚拟目录表; 容器伪路径 -> 容器目录表; 磁盘 -> Directory.Exists。</summary>
     [MethodImpl(MethodImplOptions.NoOptimization)]
     private static bool ResolveIsDir(string real)
     {
+        if (IsVirtualReal(real))
+        {
+            string rest = real[3..];
+            return VirtualDirs.ContainsKey(rest);
+        }
         if (IsContainerReal(real))
         {
             string rest = real[3..];
@@ -1071,10 +1183,16 @@ internal static partial class FakeFileSystem
         return Directory.Exists(real);
     }
 
-    /// <summary>real 路径的字节长度: 容器伪路径 -> 容器条目长度; 磁盘 -> FileInfo.Length。</summary>
+    /// <summary>real 路径的字节长度: 虚拟 natives -> 虚拟缓冲长度; 容器伪路径 -> 容器条目长度; 磁盘 -> FileInfo.Length。</summary>
     [MethodImpl(MethodImplOptions.NoOptimization)]
     private static long ResolveLength(string real)
     {
+        if (IsVirtualReal(real))
+        {
+            string rest = real[3..];
+            if (VirtualFiles.TryGetValue(rest, out VirtualEntry? ve) && ve.Buf is { } vb) { return vb.Length; }
+            return 0;
+        }
         if (IsContainerReal(real))
         {
             string rest = real[3..];
@@ -1133,6 +1251,28 @@ internal static partial class FakeFileSystem
         IO_STATUS_BLOCK* ioStatus, IntPtr buffer, uint length, IntPtr byteOffset, IntPtr key)
     {
         return Hook_NtReadFile(fileHandle, evt, apcRoutine, apcContext, out *ioStatus, buffer, length, byteOffset, key);
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvStdcall) })]
+    private static unsafe int Managed_NtWriteFile(IntPtr fileHandle, IntPtr evt, IntPtr apcRoutine, IntPtr apcContext,
+        IO_STATUS_BLOCK* ioStatus, IntPtr buffer, uint length, IntPtr byteOffset, IntPtr key)
+    {
+        return Hook_NtWriteFile(fileHandle, evt, apcRoutine, apcContext, out *ioStatus, buffer, length, byteOffset, key);
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvStdcall) })]
+    private static unsafe int Managed_NtLockFile(IntPtr fileHandle, IntPtr evt, IntPtr apcRoutine, IntPtr apcContext,
+        IO_STATUS_BLOCK* ioStatus, IntPtr byteOffset, IntPtr length, uint key, byte failImmediately, byte exclusiveLock)
+    {
+        return Hook_NtLockFile(fileHandle, evt, apcRoutine, apcContext, out *ioStatus, byteOffset, length, key,
+            failImmediately, exclusiveLock);
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvStdcall) })]
+    private static unsafe int Managed_NtUnlockFile(IntPtr fileHandle, IO_STATUS_BLOCK* ioStatus,
+        IntPtr byteOffset, IntPtr length, uint key)
+    {
+        return Hook_NtUnlockFile(fileHandle, out *ioStatus, byteOffset, length, key);
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvStdcall) })]
@@ -1258,6 +1398,19 @@ internal static partial class FakeFileSystem
             string? rest = StripZPrefix(name);
             if (rest is not null)
             {
+                // ---- PHASE18: natives 虚拟可写区 (Z:\cache\natives\ 子树, 内存不落盘) ----
+                if (IsVirtualPath(rest))
+                {
+                    bool isDirRequest = (createOptions & FILE_DIRECTORY_FILE) != 0;
+                    return Hook_VirtualOpen(out fileHandle, out ioStatus, name, rest, desiredAccess, createDisposition, isDirRequest);
+                }
+                // ---- PHASE18: 只读边界 —— 非 natives 的 Z: 路径带写访问一律拒绝 ----
+                if (HasWriteAccess(desiredAccess))
+                {
+                    Log($"[NtCreateFile] Z: read-only area write access denied '{name}' access=0x{desiredAccess:X}");
+                    ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED);
+                    return STATUS_ACCESS_DENIED;
+                }
                 // ---- PHASE16: lib\modules 不再特判真实文件。jimage 打开+映射链
                 // (osSupport::openReadOnly -> CRT _open -> CreateFileW; osSupport::map_memory ->
                 // CreateFileA -> CreateFileMappingA -> MapViewOfFileEx) 全走 kernelbase API, 其内部
@@ -1307,7 +1460,7 @@ internal static partial class FakeFileSystem
 
     [MethodImpl(MethodImplOptions.NoOptimization)]
     private static int Hook_NtOpenFile(out IntPtr fileHandle, uint desiredAccess, ref OBJECT_ATTRIBUTES objAttr,
-        out IO_STATUS_BLOCK ioStatus, uint shareAccess, uint openOptions)
+        out IO_STATUS_BLOCK ioStatus, uint shareAccess,         uint openOptions)
     {
         if (_suppressHooks > 0)
         {
@@ -1322,6 +1475,19 @@ internal static partial class FakeFileSystem
             string? rest = StripZPrefix(name);
             if (rest is not null)
             {
+                // ---- PHASE18: natives 虚拟可写区 (NtOpenFile 无 createDisposition, 恒 FILE_OPEN) ----
+                if (IsVirtualPath(rest))
+                {
+                    bool isDirRequest = (openOptions & FILE_DIRECTORY_FILE) != 0;
+                    return Hook_VirtualOpen(out fileHandle, out ioStatus, name, rest, desiredAccess, 1 /* FILE_OPEN */, isDirRequest);
+                }
+                // ---- PHASE18: 只读边界 —— 非 natives 的 Z: 路径带写访问一律拒绝 ----
+                if (HasWriteAccess(desiredAccess))
+                {
+                    Log($"[NtOpenFile] Z: read-only area write access denied '{name}' access=0x{desiredAccess:X}");
+                    ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED);
+                    return STATUS_ACCESS_DENIED;
+                }
                 string? real = TryMap(rest);
                 // PHASE9: 目录假句柄 (见 Hook_NtCreateFile 注释)
                 if (real is not null)
@@ -1358,8 +1524,7 @@ internal static partial class FakeFileSystem
     [MethodImpl(MethodImplOptions.NoOptimization)]
     private static unsafe int Hook_NtReadFile(IntPtr fileHandle, IntPtr evt, IntPtr apcRoutine, IntPtr apcContext,
         out IO_STATUS_BLOCK ioStatus, IntPtr buffer, uint length, IntPtr byteOffset, IntPtr key)
-    {
-        if (_suppressHooks > 0)
+    {        if (_suppressHooks > 0)
         {
             return _origNtReadFile!(fileHandle, evt, apcRoutine, apcContext, out ioStatus, buffer, length, byteOffset, key);
         }
@@ -1368,6 +1533,14 @@ internal static partial class FakeFileSystem
         {
             if (FakeHandles.TryGetValue(fileHandle, out FakeFile? f) && f.Buf is { } buf)
             {
+                if (f.AccessMode == 1)
+                {
+                    // PHASE18 读写互斥: 可写句柄收到 NtReadFile -> 不服务 (合理错误)
+                    ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED);
+                    ioStatus.Information = IntPtr.Zero;
+                    Log($"[NtReadFile] FAKE 0x{fileHandle:X} WRITE-ONLY handle denied ({f.Name})");
+                    return STATUS_ACCESS_DENIED;
+                }
                 long offset;
                 if (byteOffset == IntPtr.Zero)
                 {
@@ -1417,6 +1590,410 @@ internal static partial class FakeFileSystem
         finally { _suppressHooks--; }
     }
 
+    /// <summary>
+    /// PHASE18 (第 17 个钩子): NtWriteFile —— natives 虚拟写 (Z:\cache\natives 可写区)。
+    /// 只服务可写 natives 假句柄 (AccessMode==1): 写入按 ByteOffset/文件指针语义写入可变
+    /// NativeBuffer (增长 + 空洞零填充)。只读句柄/目录句柄收到写请求 -> STATUS_ACCESS_DENIED
+    /// (读写互斥, 不服务); 其余 (真实句柄) 放行 trampoline。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoOptimization)]
+    private static unsafe int Hook_NtWriteFile(IntPtr fileHandle, IntPtr evt, IntPtr apcRoutine, IntPtr apcContext,
+        out IO_STATUS_BLOCK ioStatus, IntPtr buffer, uint length, IntPtr byteOffset, IntPtr key)
+    {
+        if (_suppressHooks > 0)
+        {
+            return _origNtWriteFile!(fileHandle, evt, apcRoutine, apcContext, out ioStatus, buffer, length, byteOffset, key);
+        }
+        _suppressHooks++;
+        try
+        {
+            if (FakeHandles.TryGetValue(fileHandle, out FakeFile? f) && f.Buf is { } buf)
+            {
+                if (f.AccessMode == 0 || f.IsDir)
+                {
+                    // 只读/目录句柄收到写请求: 不服务 (合理错误; 真实内核收到假句柄只会 INVALID_HANDLE)
+                    ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED);
+                    ioStatus.Information = IntPtr.Zero;
+                    Log($"[NtWriteFile] FAKE 0x{fileHandle:X} READ-ONLY handle denied ({f.Name})");
+                    return STATUS_ACCESS_DENIED;
+                }
+                long offset;
+                if (byteOffset == IntPtr.Zero)
+                {
+                    offset = f.Pos; // kernel file-pointer semantics
+                }
+                else
+                {
+                    // OVERLAPPED 显式偏移: 按调用方 LARGE_INTEGER 原样使用
+                    offset = (long)(uint)Marshal.ReadInt32(byteOffset, 0)
+                           | ((long)(uint)Marshal.ReadInt32(byteOffset, 4) << 32);
+                }
+                if (offset < 0) { offset = 0; }
+                if (offset > int.MaxValue) { offset = int.MaxValue; }
+                long end = offset + length;
+                if (end > int.MaxValue)
+                {
+                    length = (uint)(int.MaxValue - offset);
+                    end = offset + length;
+                }
+                // 写入可变缓冲: 增长 (realloc) + 空洞零填充 (稀疏写语义, 与真实文件一致)
+                EnsureBufferCapacity(buf, (int)end);
+                if (offset > buf.Length)
+                {
+                    new Span<byte>(buf.Data + buf.Length, (int)(offset - buf.Length)).Clear();
+                }
+                if (length > 0 && buffer != IntPtr.Zero && buf.Data != null)
+                {
+                    new Span<byte>((void*)buffer, (int)length).CopyTo(new Span<byte>(buf.Data + offset, (int)length));
+                }
+                if (end > buf.Length) { buf.Length = (int)end; }
+                f.Pos = (int)end;
+                if (byteOffset != IntPtr.Zero)
+                {
+                    // keep the caller's OVERLAPPED.Offset in sync (与 NtReadFile 同契约)
+                    Marshal.WriteInt32(byteOffset, 0, (int)end);
+                    Marshal.WriteInt32(byteOffset, 4, (int)(end >> 32));
+                }
+                ioStatus.Status = IntPtr.Zero;
+                ioStatus.Information = new IntPtr((long)length);
+                Log($"[NtWriteFile] FAKE 0x{fileHandle:X} off={offset} len={length} -> {length} B ({f.Name})");
+                return 0;
+            }
+            return _origNtWriteFile!(fileHandle, evt, apcRoutine, apcContext, out ioStatus, buffer, length, byteOffset, key);
+        }
+        finally { _suppressHooks--; }
+    }
+
+    /// <summary>
+    /// PHASE18 (第 18 个钩子): NtLockFile —— NativeLibrariesBootstrap.tryLock 契约
+    /// (FileChannelImpl.tryLock -> FileDispatcherImpl.lock0 -> LockFile -> NtLockFile)。
+    /// 虚拟 natives 假句柄: 直接授予锁 (STATUS_SUCCESS, 空操作)。单进程内无真实竞争, 跨进程
+    /// 不可见 —— 授予即正确语义; 真实句柄放行 trampoline。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoOptimization)]
+    private static unsafe int Hook_NtLockFile(IntPtr fileHandle, IntPtr evt, IntPtr apcRoutine, IntPtr apcContext,
+        out IO_STATUS_BLOCK ioStatus, IntPtr byteOffset, IntPtr length, uint key, byte failImmediately, byte exclusiveLock)
+    {
+        if (_suppressHooks > 0)
+        {
+            return _origNtLockFile!(fileHandle, evt, apcRoutine, apcContext, out ioStatus, byteOffset, length, key,
+                failImmediately, exclusiveLock);
+        }
+        _suppressHooks++;
+        try
+        {
+            if (FakeHandles.TryGetValue(fileHandle, out FakeFile? f))
+            {
+                ioStatus.Status = IntPtr.Zero;
+                ioStatus.Information = IntPtr.Zero;
+                Log($"[NtLockFile] FAKE 0x{fileHandle:X} granted ({f.Name})");
+                return 0;
+            }
+            return _origNtLockFile!(fileHandle, evt, apcRoutine, apcContext, out ioStatus, byteOffset, length, key,
+                failImmediately, exclusiveLock);
+        }
+        finally { _suppressHooks--; }
+    }
+
+    /// <summary>
+    /// PHASE18 (第 19 个钩子): NtUnlockFile —— FileLock.release / channel close 解锁
+    /// (UnlockFile -> NtUnlockFile)。虚拟 natives 假句柄: 空操作成功; 真实句柄放行。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoOptimization)]
+    private static unsafe int Hook_NtUnlockFile(IntPtr fileHandle, out IO_STATUS_BLOCK ioStatus,
+        IntPtr byteOffset, IntPtr length, uint key)
+    {
+        if (_suppressHooks > 0)
+        {
+            return _origNtUnlockFile!(fileHandle, out ioStatus, byteOffset, length, key);
+        }
+        _suppressHooks++;
+        try
+        {
+            if (FakeHandles.TryGetValue(fileHandle, out FakeFile? f))
+            {
+                ioStatus.Status = IntPtr.Zero;
+                ioStatus.Information = IntPtr.Zero;
+                Log($"[NtUnlockFile] FAKE 0x{fileHandle:X} released ({f.Name})");
+                return 0;
+            }
+            return _origNtUnlockFile!(fileHandle, out ioStatus, byteOffset, length, key);
+        }
+        finally { _suppressHooks--; }
+    }
+
+    // ------------------------------------------------------------------ PHASE18: natives 虚拟可写区
+    // 只允许写入 Z:\cache\natives\ 子树 (内存, 不落盘); Z:\cache\ 其余与全部非 natives 路径
+    // 保持只读 (容器/磁盘语义不变)。读写互斥 (不允许边读边写):
+    //   1. 句柄级: 可写句柄 (AccessMode==1) 拒绝 NtReadFile; 只读句柄 (AccessMode==0) 拒绝 NtWriteFile。
+    //   2. 文件级: 写句柄未关闭时同文件读打开 -> STATUS_SHARING_VIOLATION (合理失败);
+    //      顺序写->闭->读 (LoadLibrary) 允许。
+    //   3. 写增长经 EnsureBufferCapacity 就地 realloc —— 互斥保证无读者共享缓冲, realloc 安全。
+
+    /// <summary>rest (Z: 剥前缀后的尾路径) 是否命中虚拟 natives 区 (Z:\cache\ 与 Z:\cache\natives\...)。</summary>
+    [MethodImpl(MethodImplOptions.NoOptimization)]
+    private static bool IsVirtualPath(string rest)
+    {
+        if (string.IsNullOrEmpty(rest)) { return false; }
+        if (rest.Equals("cache", StringComparison.OrdinalIgnoreCase)) { return true; }
+        if (rest.Equals(@"cache\natives", StringComparison.OrdinalIgnoreCase)) { return true; }
+        return rest.StartsWith(@"cache\natives\", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>FakeFile.Real 是否为虚拟 natives 伪路径 (形如 Z:\cache 或 Z:\cache\natives\...)。</summary>
+    [MethodImpl(MethodImplOptions.NoOptimization)]
+    private static bool IsVirtualReal(string real)
+    {
+        return real.Equals(@"Z:\cache", StringComparison.OrdinalIgnoreCase)
+            || real.StartsWith(@"Z:\cache\", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>desiredAccess 是否带写语义 (GENERIC_WRITE / FILE_WRITE_DATA / FILE_APPEND_DATA)。</summary>
+    [MethodImpl(MethodImplOptions.NoOptimization)]
+    private static bool HasWriteAccess(uint desiredAccess)
+    {
+        return (desiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+    }
+
+    /// <summary>
+    /// 虚拟 natives 文件/目录 open 业务体 (Hook_NtCreateFile/Hook_NtOpenFile 共用;
+    /// NtOpenFile 的 createDisposition 恒为 FILE_OPEN=1)。只服务 Z:\cache\natives\ 子树:
+    /// createDisposition (FILE_CREATE_DISPOSITION: 0=SUPERSEDE 1=OPEN 2=CREATE 3=OPEN_IF
+    /// 4=OVERWRITE 5=OVERWRITE_IF) 驱动新建/打开/截断; 目录 (Z:\cache 及 natives 子树) 支持
+    /// 创建+打开。Z:\cache\ 非 natives 区域视为不存在 (只读, 创建一律 ACCESS_DENIED)。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoOptimization)]
+    private static int Hook_VirtualOpen(out IntPtr fileHandle, out IO_STATUS_BLOCK ioStatus, string? name,
+        string rest, uint desiredAccess, uint createDisposition, bool isDirRequest)
+    {
+        fileHandle = IntPtr.Zero;
+        ioStatus = default;
+        // 可写边界: 只有 natives 子树可创建/写 (Z:\cache 根与其余区域只读)
+        bool inWritable = rest.StartsWith(@"cache\natives\", StringComparison.OrdinalIgnoreCase);
+        bool isFile = VirtualFiles.TryGetValue(rest, out VirtualEntry? entry);
+        bool isDir = VirtualDirs.ContainsKey(rest);
+
+        if (isDirRequest || (isDir && !isFile))
+        {
+            // ---- 目录打开/创建 (CreateDirectoryW 链: kernelbase CreateDirectory -> NtCreateFile) ----
+            switch (createDisposition)
+            {
+                case 1: // FILE_OPEN
+                    if (!isDir) { ioStatus.Status = new IntPtr(STATUS_OBJECT_NAME_NOT_FOUND); return STATUS_OBJECT_NAME_NOT_FOUND; }
+                    break;
+                case 2: // FILE_CREATE (CreateDirectoryW): 已存在 -> COLLISION (真实语义)
+                    if (isDir) { ioStatus.Status = new IntPtr(STATUS_OBJECT_NAME_COLLISION); return STATUS_OBJECT_NAME_COLLISION; }
+                    if (!inWritable) { ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED); return STATUS_ACCESS_DENIED; }
+                    VirtualDirs.TryAdd(rest, 0);
+                    EnsureVirtualAncestors(rest);
+                    break;
+                case 3: // FILE_OPEN_IF
+                    if (!isDir)
+                    {
+                        if (!inWritable) { ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED); return STATUS_ACCESS_DENIED; }
+                        VirtualDirs.TryAdd(rest, 0);
+                        EnsureVirtualAncestors(rest);
+                    }
+                    break;
+                case 5: // FILE_OVERWRITE_IF (目录少见, 保守等同 OPEN_IF)
+                    if (!isDir)
+                    {
+                        if (!inWritable) { ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED); return STATUS_ACCESS_DENIED; }
+                        VirtualDirs.TryAdd(rest, 0);
+                        EnsureVirtualAncestors(rest);
+                    }
+                    break;
+                default: // 0 (SUPERSEDE) / 4 (OVERWRITE): 目录 -> 拒绝
+                    ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED);
+                    return STATUS_ACCESS_DENIED;
+            }
+            IntPtr dh = MakeFakeHandle();
+            FakeHandles[dh] = new FakeFile { Buf = null, Pos = 0, IsDir = true, Real = @"Z:\" + rest, Name = name ?? "" };
+            ioStatus.Status = IntPtr.Zero;
+            ioStatus.Information = new IntPtr(1);
+            fileHandle = dh;
+            Log($"[NtCreateFile] FAKE VDIR handle=0x{dh:X} '{name}' -> 'Z:\\{rest}'");
+            return 0;
+        }
+
+        // ---- 文件打开/创建 (JVM 提取链: FileOutputStream/CreateFileW -> NtCreateFile) ----
+        switch (createDisposition)
+        {
+            case 1: // FILE_OPEN (OPEN_EXISTING)
+                if (!isFile) { ioStatus.Status = new IntPtr(STATUS_OBJECT_NAME_NOT_FOUND); return STATUS_OBJECT_NAME_NOT_FOUND; }
+                break;
+            case 2: // FILE_CREATE (CREATE_NEW): 已存在 -> COLLISION
+                if (isFile) { ioStatus.Status = new IntPtr(STATUS_OBJECT_NAME_COLLISION); return STATUS_OBJECT_NAME_COLLISION; }
+                if (!inWritable) { ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED); return STATUS_ACCESS_DENIED; }
+                entry = CreateVirtualFile(rest);
+                break;
+            case 3: // FILE_OPEN_IF (OPEN_ALWAYS)
+                if (!isFile)
+                {
+                    if (!inWritable) { ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED); return STATUS_ACCESS_DENIED; }
+                    entry = CreateVirtualFile(rest);
+                }
+                break;
+            case 4: // FILE_OVERWRITE (TRUNCATE_EXISTING)
+                if (!isFile) { ioStatus.Status = new IntPtr(STATUS_OBJECT_NAME_NOT_FOUND); return STATUS_OBJECT_NAME_NOT_FOUND; }
+                break;
+            case 5: // FILE_OVERWRITE_IF (CREATE_ALWAYS)
+                if (!isFile)
+                {
+                    if (!inWritable) { ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED); return STATUS_ACCESS_DENIED; }
+                    entry = CreateVirtualFile(rest);
+                }
+                break;
+            default: // 0 (FILE_SUPERSEDE): 视为 OVERWRITE_IF
+                if (!isFile)
+                {
+                    if (!inWritable) { ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED); return STATUS_ACCESS_DENIED; }
+                    entry = CreateVirtualFile(rest);
+                }
+                break;
+        }
+        if (entry is null) { ioStatus.Status = new IntPtr(STATUS_OBJECT_NAME_NOT_FOUND); return STATUS_OBJECT_NAME_NOT_FOUND; }
+
+        bool write = HasWriteAccess(desiredAccess);
+        // 读写互斥 (文件级): 写打开要求无可读句柄; 读打开要求无可写句柄
+        if (write)
+        {
+            if (entry.OpenReadCount > 0)
+            {
+                Log($"[NtCreateFile] FAKE VFILE SHARING_VIOLATION (write open while readers) '{name}' -> 'Z:\\{rest}'");
+                ioStatus.Status = new IntPtr(STATUS_SHARING_VIOLATION);
+                return STATUS_SHARING_VIOLATION;
+            }
+            entry.OpenWriteCount++;
+        }
+        else
+        {
+            if (entry.OpenWriteCount > 0)
+            {
+                Log($"[NtCreateFile] FAKE VFILE SHARING_VIOLATION (read open while writer) '{name}' -> 'Z:\\{rest}'");
+                ioStatus.Status = new IntPtr(STATUS_SHARING_VIOLATION);
+                return STATUS_SHARING_VIOLATION;
+            }
+            entry.OpenReadCount++;
+        }
+        // OVERWRITE / OVERWRITE_IF / SUPERSEDE: 截断 (真实语义: 只读访问做 OVERWRITE -> ACCESS_DENIED)
+        if (createDisposition == 4 || createDisposition == 5 || createDisposition == 0)
+        {
+            if (!write)
+            {
+                if (entry.OpenWriteCount > 0) { entry.OpenWriteCount--; }
+                ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED);
+                return STATUS_ACCESS_DENIED;
+            }
+            SetVirtualLength(entry.Buf, 0);
+        }
+        Interlocked.Increment(ref entry.Buf.RefCount);
+        IntPtr fh = MakeFakeHandle();
+        FakeHandles[fh] = new FakeFile
+        {
+            Buf = entry.Buf, Pos = 0, IsDir = false, Real = @"Z:\" + rest, Name = name ?? "",
+            AccessMode = write ? 1 : 0, VEntry = entry,
+        };
+        ioStatus.Status = IntPtr.Zero;
+        ioStatus.Information = new IntPtr(1);
+        fileHandle = fh;
+        Log($"[NtCreateFile] FAKE VFILE 0x{fh:X} '{name}' -> 'Z:\\{rest}' ({entry.Buf.Length} B, mode={(write ? "write" : "read")})");
+        return 0;
+    }
+
+    /// <summary>创建虚拟 natives 文件条目 (空缓冲, 条目持 1 引用; 祖先目录自动补齐)。</summary>
+    [MethodImpl(MethodImplOptions.NoOptimization)]
+    private static VirtualEntry CreateVirtualFile(string rest)
+    {
+        EnsureVirtualAncestors(rest);
+        var entry = new VirtualEntry { Buf = new NativeBuffer { Data = null, Length = 0, Capacity = 0, RefCount = 1 } };
+        VirtualFiles[rest] = entry;
+        return entry;
+    }
+
+    /// <summary>确保 rest 的全部祖先目录存在于虚拟目录表。</summary>
+    [MethodImpl(MethodImplOptions.NoOptimization)]
+    private static void EnsureVirtualAncestors(string rest)
+    {
+        int idx = rest.IndexOf('\\');
+        while (idx > 0)
+        {
+            VirtualDirs.TryAdd(rest[..idx], 0);
+            idx = rest.IndexOf('\\', idx + 1);
+        }
+    }
+
+    /// <summary>可写 NativeBuffer 容量保证 (NativeMemory.Realloc 就地增长; 读写互斥保证无读者共享)。</summary>
+    [MethodImpl(MethodImplOptions.NoOptimization)]
+    private static unsafe void EnsureBufferCapacity(NativeBuffer buf, int needed)
+    {
+        if (needed <= buf.Capacity) { return; }
+        int newCap = Math.Max(needed, Math.Max(4096, buf.Capacity * 2));
+        if (buf.Data == null) { buf.Data = (byte*)NativeMemory.Alloc((nuint)newCap); }
+        else { buf.Data = (byte*)NativeMemory.Realloc(buf.Data, (nuint)newCap); }
+        buf.Capacity = newCap;
+    }
+
+    /// <summary>设置虚拟缓冲长度: 增长时零填充扩展, 收缩仅改 Length (truncate 语义)。</summary>
+    [MethodImpl(MethodImplOptions.NoOptimization)]
+    private static unsafe void SetVirtualLength(NativeBuffer buf, int newLen)
+    {
+        if (newLen < 0) { newLen = 0; }
+        if (newLen > buf.Capacity) { EnsureBufferCapacity(buf, newLen); }
+        if (newLen > buf.Length && buf.Data != null)
+        {
+            new Span<byte>(buf.Data + buf.Length, newLen - buf.Length).Clear();
+        }
+        buf.Length = newLen;
+    }
+
+    /// <summary>取或建虚拟 natives 文件条目 (pre-detour 直写 + hook 创建共用)。</summary>
+    [MethodImpl(MethodImplOptions.NoOptimization)]
+    private static VirtualEntry GetOrCreateVirtualEntry(string rest)
+    {
+        if (VirtualFiles.TryGetValue(rest, out VirtualEntry? e)) { return e; }
+        EnsureVirtualAncestors(rest);
+        var entry = new VirtualEntry { Buf = new NativeBuffer { Data = null, Length = 0, Capacity = 0, RefCount = 1 } };
+        VirtualFiles[rest] = entry;
+        return entry;
+    }
+
+    // ------------------------------------------------------------------ PHASE18: pre-detour 直写 API
+    // 在 Warmup() (detour 安装前) 直接向虚拟 natives 区写入, 不经 hook: 供 ExtractNatives 使用。
+    // 仅 Z:\cache\natives\ 子树有效; 其余路径抛 ArgumentException (只读边界)。
+
+    /// <summary>写/覆写一个虚拟 natives 文件 (整文件替换语义; pre-detour 专用, 不经 hook)。</summary>
+    public static unsafe void WriteVirtualNativesFile(string zPath, byte[] data)
+    {
+        string? rest = StripZPrefix(zPath);
+        if (rest is null || !IsVirtualPath(rest) || !rest.StartsWith(@"cache\natives\", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException($"WriteVirtualNativesFile: 只允许 Z:\\cache\\natives\\ 子树, got '{zPath}'");
+        }
+        VirtualEntry entry = GetOrCreateVirtualEntry(rest);
+        EnsureBufferCapacity(entry.Buf, data.Length);
+        if (data.Length > 0 && entry.Buf.Data != null)
+        {
+            fixed (byte* p = data)
+            {
+                Buffer.MemoryCopy(p, entry.Buf.Data, entry.Buf.Capacity, data.Length);
+            }
+        }
+        entry.Buf.Length = data.Length;
+    }
+
+    /// <summary>确保虚拟 natives 目录存在 (含祖先; pre-detour 专用, 不经 hook)。</summary>
+    public static void EnsureVirtualDir(string zPath)
+    {
+        string? rest = StripZPrefix(zPath);
+        if (rest is null || !IsVirtualPath(rest) || !rest.StartsWith(@"cache\natives", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException($"EnsureVirtualDir: 只允许 Z:\\cache\\natives\\ 子树, got '{zPath}'");
+        }
+        EnsureVirtualAncestors(rest);
+        VirtualDirs.TryAdd(rest, 0);
+    }
+
     [MethodImpl(MethodImplOptions.NoOptimization)]
     private static int Hook_NtDuplicateObject(IntPtr sourceProcessHandle, IntPtr sourceHandle,
         IntPtr targetProcessHandle, out IntPtr targetHandle, uint desiredAccess, uint handleAttributes, uint options)
@@ -1439,6 +2016,12 @@ internal static partial class FakeFileSystem
                 && FakeHandles.TryGetValue(sourceHandle, out FakeFile? f))
             {
                 if (f.Buf is not null) { Interlocked.Increment(ref f.Buf.RefCount); }
+                // PHASE18: 虚拟 natives 句柄复制 -> 模式与互斥计数一并传播
+                if (f.VEntry is { } dve && !f.IsDir)
+                {
+                    if (f.AccessMode == 1) { dve.OpenWriteCount++; }
+                    else { dve.OpenReadCount++; }
+                }
                 IntPtr h = MakeFakeHandle();
                 FakeHandles[h] = new FakeFile
                 {
@@ -1447,12 +2030,19 @@ internal static partial class FakeFileSystem
                     IsDir = f.IsDir,
                     Real = f.Real,
                     Name = f.Name,
+                    AccessMode = f.AccessMode,
+                    VEntry = f.VEntry,
                 };
                 if ((options & DUPLICATE_CLOSE_SOURCE) != 0)
                 {
                     // DuplicateHandle 语义: CLOSE_SOURCE 关闭源句柄 —— 移除源条目并 DropRef
                     // (副本已 AddRef 持有, 底层字节存活)。
                     FakeHandles.TryRemove(sourceHandle, out _);
+                    if (f.VEntry is { } sve && !f.IsDir)
+                    {
+                        if (f.AccessMode == 1) { sve.OpenWriteCount--; }
+                        else { sve.OpenReadCount--; }
+                    }
                     ReleaseBuffer(f.Buf);
                 }
                 targetHandle = h;
@@ -1474,6 +2064,18 @@ internal static partial class FakeFileSystem
         {
             if (FakeHandles.TryRemove(handle, out FakeFile? f))
             {
+                // PHASE18: 虚拟 natives 句柄关闭 -> 读写互斥计数归还
+                if (f.VEntry is { } ve && !f.IsDir)
+                {
+                    if (f.AccessMode == 1) { ve.OpenWriteCount--; }
+                    else { ve.OpenReadCount--; }
+                    // PHASE18: delete-on-close (FileDispositionInformation) -> 从虚拟表移除
+                    if (f.DeleteOnClose && VirtualFiles.TryRemove(f.Real[3..], out _))
+                    {
+                        ReleaseBuffer(ve.Buf);
+                        Log($"[NtClose] FAKE 0x{handle:X} DELETED virtual file ({f.Name})");
+                    }
+                }
                 ReleaseBuffer(f.Buf);
                 if (VerboseHooks) { Log($"[NtClose] FAKE 0x{handle:X} removed ({f.Name})"); }
                 return 0;
@@ -1510,8 +2112,13 @@ internal static partial class FakeFileSystem
                 const int FileStandardInformation = 5;     // FILE_STANDARD_INFORMATION (24 B)
                 const int FileInternalInformation = 6;     // 8 B (index number)
                 const int FilePositionInformation = 14;    // FILE_POSITION_INFORMATION (8 B)
-                const int FileAllInformation = 21;         // variable (Basic+Standard+Internal+Ea+Access+Position+Mode+Alignment+Name)
+                // PHASE18 勘误: FileAllInformation = 18 (104 B 固定 + 尾部名称), 此前误标为 21 ——
+                // GetFileInformationByHandle (FileKey.init/tryLock) 查 class 18 -> INVALID_INFO_CLASS
+                // -> ERROR_INVALID_PARAMETER 崩溃。21 = FileAlternateNameInformation。
+                const int FileAllInformation = 18;
+                const int FileAlternateNameInformation = 21;
                 const int FileAttributeTagInformation = 35; // 8 B
+                const int FileNameInformation = 9;         // FILE_NAME_INFORMATION (GetFinalPathNameByHandle)
                 long sz = f.Buf?.Length ?? 0;
                 // PHASE9: 目录假句柄的属性位 (FindFirstFileW 枚举结果 / GetFileInformationByHandleEx)
                 int attrs = f.IsDir ? 0x10 : 0x20; // FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE
@@ -1558,16 +2165,24 @@ internal static partial class FakeFileSystem
                     case FileAllInformation:
                         // FILE_ALL_INFORMATION: Basic@0(40) + Standard@40(24) + Internal@64(8) +
                         // Ea@72(4) + Access@76(4) + Position@80(8) + Mode@88(4) + Alignment@92(4) +
-                        // Name@96(2 + chars). Fill what the JVM's WindowsFileAttributes may read.
-                        for (int i = 0; i < 96; i++) { Marshal.WriteByte(fileInformation, i, 0); }
+                        // Name@96(4 = 名称长度) + FileName@100。固定部 104 B。GetFileInformationByHandle
+                        // (FileKey.init / FileLockTable) 依赖本类。
+                        for (int i = 0; i < 104; i++) { Marshal.WriteByte(fileInformation, i, 0); }
                         Marshal.WriteInt32(fileInformation, 32, attrs);             // Basic.FileAttributes
                         Marshal.WriteInt64(fileInformation, 40, sz);           // Standard.AllocationSize
                         Marshal.WriteInt64(fileInformation, 48, sz);           // Standard.EndOfFile
                         Marshal.WriteByte(fileInformation, 61, f.IsDir ? (byte)1 : (byte)0); // Standard.Directory
                         Marshal.WriteInt64(fileInformation, 80, f.Pos);        // Position.CurrentByteOffset
                         ioStatus.Status = IntPtr.Zero;
-                        ioStatus.Information = new IntPtr(96);
+                        ioStatus.Information = new IntPtr(104);
                         if (VerboseHooks) { Log($"[NtQueryInformationFile] FAKE 0x{fileHandle:X} FileAllInformation -> {sz} B ({f.Name})"); }
+                        return 0;
+                    case FileAlternateNameInformation:
+                        // FILE_ALTERNATE_NAME_INFORMATION (8 B 固定 + 名称): FileNameLength@0 (u32),
+                        // FileName@8 (8.3 短名 UTF-16)。返回空短名即可 (长度 0)。
+                        for (int i = 0; i < 8; i++) { Marshal.WriteByte(fileInformation, i, 0); }
+                        ioStatus.Status = IntPtr.Zero;
+                        ioStatus.Information = new IntPtr(8);
                         return 0;
                     case FileAttributeTagInformation:
                         // FILE_ATTRIBUTE_TAG_INFORMATION (8 B): FileAttributes@0, ReparseTag@4
@@ -1576,6 +2191,31 @@ internal static partial class FakeFileSystem
                         ioStatus.Status = IntPtr.Zero;
                         ioStatus.Information = new IntPtr(8);
                         return 0;
+                    case FileNameInformation:
+                        // PHASE18: FILE_NAME_INFORMATION —— FileNameLength@0 (u32), FileName@8
+                        // (UTF-16, 无 NULL 结尾)。GetFinalPathNameByHandleW / JDK canonicalize0
+                        // 依赖 (SystemReport getFileStore 等)。返回完整对象名
+                        // (\??\Z:\cache\natives\... -> kernelbase 剥前缀后 JDK 得 Z:\...)。
+                        {
+                            string fn = f.Name.Length > 0 ? f.Name : @"\??\" + f.Real;
+                            int need = 8 + fn.Length * 2;
+                            if (length < (uint)need)
+                            {
+                                ioStatus.Status = new IntPtr(STATUS_BUFFER_OVERFLOW);
+                                ioStatus.Information = new IntPtr(need);
+                                if (VerboseHooks) { Log($"[NtQueryInformationFile] FAKE 0x{fileHandle:X} FileNameInformation -> BUFFER_OVERFLOW ({f.Name})"); }
+                                return STATUS_BUFFER_OVERFLOW;
+                            }
+                            Marshal.WriteInt32(fileInformation, 0, fn.Length * 2);
+                            for (int i = 0; i < fn.Length; i++)
+                            {
+                                Marshal.WriteInt16(fileInformation, 8 + i * 2, (short)fn[i]);
+                            }
+                            ioStatus.Status = IntPtr.Zero;
+                            ioStatus.Information = new IntPtr(need);
+                            if (VerboseHooks) { Log($"[NtQueryInformationFile] FAKE 0x{fileHandle:X} FileNameInformation -> '{fn}' ({f.Name})"); }
+                            return 0;
+                        }
                 }
                 Log($"[NtQueryInformationFile] FAKE 0x{fileHandle:X} class={fileInformationClass} -> STATUS_INVALID_INFO_CLASS");
                 ioStatus.Status = new IntPtr(STATUS_INVALID_INFO_CLASS);
@@ -1601,6 +2241,21 @@ internal static partial class FakeFileSystem
             string? rest = StripZPrefix(name);
             if (rest is not null)
             {
+                // ---- PHASE18: 虚拟 natives 区 stat (Z:\cache\natives\... 目录/文件) ----
+                if (IsVirtualPath(rest))
+                {
+                    bool vdir = VirtualDirs.ContainsKey(rest);
+                    bool vfile = !vdir && VirtualFiles.ContainsKey(rest);
+                    if (!vdir && !vfile)
+                    {
+                        if (VerboseHooks) { Log($"[NtQueryAttributesFile] Z: missing '{name}' -> STATUS_OBJECT_NAME_NOT_FOUND"); }
+                        return STATUS_OBJECT_NAME_NOT_FOUND;
+                    }
+                    for (int i = 0; i < 40; i++) Marshal.WriteByte(fileInformation, i, 0);
+                    if (vdir) { Marshal.WriteInt32(fileInformation, 36, 0x10); } // FILE_ATTRIBUTE_DIRECTORY
+                    if (VerboseHooks) { Log($"[NtQueryAttributesFile] FAKE V{(vdir ? "dir" : "file")} '{name}' -> 'Z:\\{rest}'"); }
+                    return 0;
+                }
                 string? real = TryMap(rest);
                 if (real is not null)
                 {
@@ -1635,6 +2290,29 @@ internal static partial class FakeFileSystem
             string? rest = StripZPrefix(name);
             if (rest is not null)
             {
+                // ---- PHASE18: 虚拟 natives 区 stat (FILE_NETWORK_OPEN_INFORMATION, 56 B) ----
+                if (IsVirtualPath(rest))
+                {
+                    bool vdir = VirtualDirs.ContainsKey(rest);
+                    bool vfile = false;
+                    long vlen = 0;
+                    if (!vdir && VirtualFiles.TryGetValue(rest, out VirtualEntry? ve) && ve.Buf is { } vb)
+                    {
+                        vfile = true;
+                        vlen = vb.Length;
+                    }
+                    if (!vdir && !vfile)
+                    {
+                        if (VerboseHooks) { Log($"[NtQueryFullAttributesFile] Z: missing '{name}' -> STATUS_OBJECT_NAME_NOT_FOUND"); }
+                        return STATUS_OBJECT_NAME_NOT_FOUND;
+                    }
+                    for (int i = 0; i < 56; i++) Marshal.WriteByte(fileInformation, i, 0);
+                    Marshal.WriteInt64(fileInformation, 32, vlen); // AllocationSize
+                    Marshal.WriteInt64(fileInformation, 40, vlen); // EndOfFile
+                    if (vdir) { Marshal.WriteInt32(fileInformation, 48, 0x10); } // FILE_ATTRIBUTE_DIRECTORY
+                    if (VerboseHooks) { Log($"[NtQueryFullAttributesFile] FAKE V{(vdir ? "dir" : "file")} '{name}' -> 'Z:\\{rest}' ({vlen} B)"); }
+                    return 0;
+                }
                 string? real = TryMap(rest);
                 if (real is not null)
                 {
@@ -1722,6 +2400,9 @@ internal static partial class FakeFileSystem
             if (FakeHandles.TryGetValue(fileHandle, out FakeFile? f))
             {
                 const int FilePositionInformation = 14; // FILE_INFORMATION_CLASS (see NtQueryInformationFile)
+                const int FileEndOfFileInformation = 20; // FILE_END_OF_FILE_INFORMATION (8 B)
+                const int FileDispositionInformation = 13;   // 1 B: DeleteFile (BOOLEAN)
+                const int FileDispositionInformationEx = 60; // 4 B: flags (FILE_DISPOSITION_DELETE=1)
                 if (fileInformationClass == FilePositionInformation && length >= 8)
                 {
                     // FILE_POSITION_INFORMATION (8 B): CurrentByteOffset@0 (i64) -- the new file
@@ -1731,6 +2412,48 @@ internal static partial class FakeFileSystem
                     ioStatus.Status = IntPtr.Zero;
                     ioStatus.Information = new IntPtr(8);
                     if (VerboseHooks) { Log($"[NtSetInformationFile] FAKE 0x{fileHandle:X} FilePositionInformation -> pos={f.Pos} ({f.Name})"); }
+                    return 0;
+                }
+                if (fileInformationClass == FileEndOfFileInformation && length >= 8)
+                {
+                    // PHASE18: FILE_END_OF_FILE_INFORMATION (8 B): EndOfFile@0 (i64) —— 截断/扩展
+                    // 文件长度 (仅可写句柄; truncate 更新 Length, 扩展零填充)。
+                    if (f.Buf is null || f.AccessMode == 0)
+                    {
+                        ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED);
+                        ioStatus.Information = IntPtr.Zero;
+                        Log($"[NtSetInformationFile] FAKE 0x{fileHandle:X} FileEndOfFile denied (read-only handle) ({f.Name})");
+                        return STATUS_ACCESS_DENIED;
+                    }
+                    long eof = Marshal.ReadInt64(fileInformation, 0);
+                    if (eof < 0) { eof = 0; }
+                    if (eof > int.MaxValue) { eof = int.MaxValue; }
+                    SetVirtualLength(f.Buf, (int)eof);
+                    ioStatus.Status = IntPtr.Zero;
+                    ioStatus.Information = new IntPtr(8);
+                    Log($"[NtSetInformationFile] FAKE 0x{fileHandle:X} FileEndOfFileInformation -> {eof} B ({f.Name})");
+                    return 0;
+                }
+                if ((fileInformationClass == FileDispositionInformation && length >= 1)
+                    || (fileInformationClass == FileDispositionInformationEx && length >= 4))
+                {
+                    // PHASE18: delete-on-close (Files.delete / DeleteFileW 链)。虚拟 natives 文件
+                    // 置位后于 NtClose 从虚拟表移除 (条目缓冲引用归还); 容器/磁盘假文件 (VEntry
+                    // null) 不可删 (只读语义) -> INVALID_INFO_CLASS。目录假句柄不可删。
+                    if (f.IsDir || f.VEntry is null)
+                    {
+                        Log($"[NtSetInformationFile] FAKE 0x{fileHandle:X} class={fileInformationClass} delete denied ({f.Name})");
+                        ioStatus.Status = new IntPtr(STATUS_ACCESS_DENIED);
+                        ioStatus.Information = IntPtr.Zero;
+                        return STATUS_ACCESS_DENIED;
+                    }
+                    bool del = fileInformationClass == FileDispositionInformation
+                        ? Marshal.ReadByte(fileInformation, 0) != 0
+                        : (Marshal.ReadInt32(fileInformation, 0) & 0x1) != 0; // FILE_DISPOSITION_DELETE
+                    f.DeleteOnClose = del;
+                    ioStatus.Status = IntPtr.Zero;
+                    ioStatus.Information = new IntPtr(fileInformationClass == FileDispositionInformation ? 1 : 4);
+                    Log($"[NtSetInformationFile] FAKE 0x{fileHandle:X} class={fileInformationClass} deleteOnClose={del} ({f.Name})");
                     return 0;
                 }
                 Log($"[NtSetInformationFile] FAKE 0x{fileHandle:X} class={fileInformationClass} -> STATUS_INVALID_INFO_CLASS");
@@ -1897,8 +2620,31 @@ internal static partial class FakeFileSystem
             bool injectTops = f.IsDir && string.Equals(f.Real, JdkRoot, StringComparison.OrdinalIgnoreCase);
             if (f.IsDir)
             {
+                // ---- PHASE18: 虚拟 natives 目录枚举 (VirtualDirs/VirtualFiles 前缀匹配, 仅直接子项) ----
+                if (IsVirtualReal(f.Real))
+                {
+                    string vdir = f.Real[3..];
+                    string vprefix = vdir.Length == 0 ? "" : vdir + @"\";
+                    foreach (string k in VirtualDirs.Keys)
+                    {
+                        if (vprefix.Length == 0 || !k.StartsWith(vprefix, StringComparison.OrdinalIgnoreCase)) { continue; }
+                        string child = k[vprefix.Length..];
+                        if (child.Length == 0 || child.Contains('\\')) { continue; }
+                        if (!MatchesPattern(child, pat)) { continue; }
+                        list.Add(new DirEntry(child, true, 0, 0, 0, 0, 0));
+                    }
+                    foreach (KeyValuePair<string, VirtualEntry> kv in VirtualFiles)
+                    {
+                        if (vprefix.Length == 0 || !kv.Key.StartsWith(vprefix, StringComparison.OrdinalIgnoreCase)) { continue; }
+                        string child = kv.Key[vprefix.Length..];
+                        if (child.Length == 0 || child.Contains('\\')) { continue; }
+                        if (!MatchesPattern(child, pat)) { continue; }
+                        int vlen = kv.Value.Buf is { } vb ? vb.Length : 0;
+                        list.Add(new DirEntry(child, false, vlen, 0, 0, 0, 0));
+                    }
+                }
                 // 容器分支 (阶段 2): f.Real 是 Z: 伪路径 -> 从容器目录表枚举
-                if (IsContainerReal(f.Real))
+                else if (IsContainerReal(f.Real))
                 {
                     string rest = f.Real[3..];
                     string? key = rest.Length == 0 ? "" : (Container.TryMapKey(rest, out string k, out bool isDir) && isDir ? k : null);

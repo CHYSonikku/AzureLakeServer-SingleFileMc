@@ -17,9 +17,9 @@ namespace SingleFileMc;
 ///
 /// Production flow (single stage, the former stage D):
 ///   parse version json -> windows-filtered library classpath (Z:\... jar list) + version jar ->
-///   build game/jvm args (template substitution) -> natives: temporary extraction to
-///   <gameDir>\cache\natives\{java,jna,lwjgl,netty} (PHASE15: gameDir 内统一缓存, 退出清理,
-///   %TEMP% 零残留; full memory layout arrives with the natives-virtualization task) -> gameDir
+///   build game/jvm args (template substitution) -> natives: PHASE18 全部虚拟化 —— 提取到
+///   Z:\cache\natives\java (FakeFileSystem 虚拟 natives 区, 内存不落盘; 运行期 JNA/LWJGL/
+///   Netty 提取经 NtWriteFile hook 写入同一虚拟区) -> gameDir
 ///   creation -> Client.main(String[]) via JNI (NewObjectArray +
 ///   NewStringUTF + GetStaticMethodID + CallStaticVoidMethodA), watchdog 180 s, window/log evidence.
 ///
@@ -58,7 +58,10 @@ internal static class McLaunch
     public static string[] MissingJars = []; // windows-allowed artifacts absent from disk
     public static string[] NativesSources = [];
     public static string GameDir = "";       // <exe>\game (real, writable)
-    public static string NativesDir = "";    // <gameDir>\cache\natives (PHASE15: 退出时清理, %TEMP% 零残留)
+    // PHASE18: natives 全部虚拟化 —— Z:\cache\natives (内存, 不落盘; 仅该子树可写)。
+    // 不再指向真实 <gameDir>\cache\natives: 提取 (pre-detour 直写虚拟区) + JVM 运行期
+    // 提取 (NtWriteFile hook) 都落在虚拟 natives 区, 真实 cache 零 natives, %TEMP% 零残留。
+    public static string NativesDir = @"Z:\cache\natives";
     public static int AllowedLibraries;      // windows-filtered library count (classpath excludes the version jar)
     public static int TotalLibraries;
     public static int NativesExtracted;
@@ -116,13 +119,16 @@ internal static class McLaunch
     {
         Console.WriteLine("[prejit] Phase 2 (MC launch) warmup ...");
         GameDir = Path.Combine(AppContext.BaseDirectory, "game");
-        NativesDir = Path.Combine(AppContext.BaseDirectory, "game", "cache", "natives");
+        // PHASE18: natives 虚拟化 —— 提取目标 = Z:\cache\natives (FakeFileSystem 虚拟可写区,
+        // 内存不落盘); 真实 game\cache 不再产生 natives。
+        NativesDir = @"Z:\cache\natives";
         PrepareVars();
         BuildFromVersionJson();
         NativesExtracted = ExtractNatives();
         EnsureGameDir();
         // PHASE15: JIT 预热退出清理路径 (post-detour 在 watchdog 线程执行: Directory.Delete
         // 递归 + File API 必须在 detour 前编译; 真实执行一次 dummy 创建+删除, 覆盖全部内部链)。
+        // PHASE18: 真实 game\cache 仅剩 dummy 清理探测 (natives 已虚拟化, 不再落盘)。
         CleanupWarmup();
         // watchdog plumbing: window scan + log tail + thread machinery (compiled pre-detour)
         _ = FindMinecraftWindows();
@@ -346,19 +352,19 @@ internal static class McLaunch
     }
 
     /// <summary>
-    /// TEMPORARY natives scheme (PHASE15: 提取到 <gameDir>\cache\natives, 退出清理, %TEMP% 零残留;
-    /// 完全内存化随 natives 虚拟化任务): extract
-    /// every natives-windows jar into {NativesDir}\java (serves -Djava.library.path);
-    /// create the lwjgl/jna/netty siblings (SharedLibraryExtractPath / jna.tmpdir / netty.workdir).
-    /// 容器激活时 natives jar 从容器读 (字节 -> 内存 ZipArchive), 磁盘模式保持 ZipFile.OpenRead。
+    /// PHASE18 (natives 虚拟化): 提取到虚拟 natives 区 (Z:\cache\natives\java, 内存不落盘)。
+    /// 不再写真实盘 —— 直接向 FakeFileSystem 虚拟 natives 区写入 (pre-detour 直写 API, 不经
+    /// hook, 在 Warmup() detour 前调用); lwjgl/jna/netty 兄弟目录仅建虚拟目录 (运行期提取
+    /// 目标, 与旧真实盘布局一一对应)。容器激活时 natives jar 从容器读 (字节 -> 内存 ZipArchive),
+    /// 磁盘模式保持 ZipFile.OpenRead。
     /// </summary>
     private static int ExtractNatives()
     {
-        string target = Path.Combine(NativesDir, "java");
-        Directory.CreateDirectory(target);
-        Directory.CreateDirectory(Path.Combine(NativesDir, "lwjgl"));
-        Directory.CreateDirectory(Path.Combine(NativesDir, "jna"));
-        Directory.CreateDirectory(Path.Combine(NativesDir, "netty"));
+        string target = @"Z:\cache\natives\java";
+        FakeFileSystem.EnsureVirtualDir(target);
+        FakeFileSystem.EnsureVirtualDir(@"Z:\cache\natives\lwjgl");
+        FakeFileSystem.EnsureVirtualDir(@"Z:\cache\natives\jna");
+        FakeFileSystem.EnsureVirtualDir(@"Z:\cache\natives\netty");
         int files = 0;
         foreach (string jarKey in NativesSources)
         {
@@ -376,8 +382,11 @@ internal static class McLaunch
                     foreach (ZipArchiveEntry entry in za.Entries)
                     {
                         if (entry.FullName.EndsWith('/')) { continue; }
-                        string dest = Path.Combine(target, Path.GetFileName(entry.FullName));
-                        entry.ExtractToFile(dest, true);
+                        string dest = @"Z:\cache\natives\java\" + Path.GetFileName(entry.FullName);
+                        using Stream es = entry.Open();
+                        byte[] data = new byte[entry.Length];
+                        es.ReadExactly(data);
+                        FakeFileSystem.WriteVirtualNativesFile(dest, data);
                         files++;
                     }
                 }
@@ -387,8 +396,11 @@ internal static class McLaunch
                     foreach (ZipArchiveEntry entry in za.Entries)
                     {
                         if (entry.FullName.EndsWith('/')) { continue; }
-                        string dest = Path.Combine(target, Path.GetFileName(entry.FullName));
-                        entry.ExtractToFile(dest, true);
+                        string dest = @"Z:\cache\natives\java\" + Path.GetFileName(entry.FullName);
+                        using Stream es = entry.Open();
+                        byte[] data = new byte[entry.Length];
+                        es.ReadExactly(data);
+                        FakeFileSystem.WriteVirtualNativesFile(dest, data);
                         files++;
                     }
                 }
@@ -398,7 +410,7 @@ internal static class McLaunch
                 Console.WriteLine($"[mc] natives extract FAILED {jarKey}:\n{ex}");
             }
         }
-        Console.WriteLine($"[mc] natives extracted {files} files from {NativesSources.Length} jars -> {target}");
+        Console.WriteLine($"[mc] natives extracted {files} files from {NativesSources.Length} jars -> virtual {target}");
         return files;
     }
 

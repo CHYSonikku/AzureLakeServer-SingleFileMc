@@ -105,6 +105,23 @@ typedef NTSTATUS (NTAPI *PFN_CB_NtReadFile)(HANDLE FileHandle, HANDLE Event,
     PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock,
     PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key);
 
+// PHASE18: NtWriteFile (第 17 个钩子, natives 虚拟写)。签名与 NtReadFile 一致。
+typedef NTSTATUS (NTAPI *PFN_CB_NtWriteFile)(HANDLE FileHandle, HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock,
+    PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key);
+
+// PHASE18 (第 18 个钩子): NtLockFile —— NativeLibrariesBootstrap.tryLock 契约
+// (FileChannelImpl.tryLock -> lock0 -> LockFile -> NtLockFile)。
+typedef NTSTATUS (NTAPI *PFN_CB_NtLockFile)(HANDLE FileHandle, HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER ByteOffset, PLARGE_INTEGER Length, ULONG Key,
+    BOOLEAN FailImmediately, BOOLEAN ExclusiveLock);
+
+// PHASE18 (第 19 个钩子): NtUnlockFile —— FileLock.release / channel close 解锁。
+typedef NTSTATUS (NTAPI *PFN_CB_NtUnlockFile)(HANDLE FileHandle,
+    PIO_STATUS_BLOCK IoStatusBlock, PLARGE_INTEGER ByteOffset,
+    PLARGE_INTEGER Length, ULONG Key);
+
 typedef NTSTATUS (NTAPI *PFN_CB_NtClose)(HANDLE Handle);
 
 typedef NTSTATUS (NTAPI *PFN_CB_NtQueryInformationFile)(HANDLE FileHandle,
@@ -187,6 +204,11 @@ typedef struct _SFMC_BINDINGS {
     PFN_CB_NtQueryDirectoryFileEx NtQueryDirectoryFileEx;
     // PHASE16: NtDuplicateObject (第 16 个钩子, JDK 25 FileChannelImpl.map 复制句柄)
     PFN_CB_NtDuplicateObject NtDuplicateObject;
+    // PHASE18: NtWriteFile (第 17 个钩子, natives 虚拟写)
+    PFN_CB_NtWriteFile NtWriteFile;
+    // PHASE18 (第 18/19 个钩子): NtLockFile/NtUnlockFile (tryLock 契约)
+    PFN_CB_NtLockFile NtLockFile;
+    PFN_CB_NtUnlockFile NtUnlockFile;
     // Orig trampoline (MinHook.NET CreateHook 返回; 签名与回调一致)
     PFN_CB_NtCreateFile OrigNtCreateFile;
     PFN_CB_NtOpenFile OrigNtOpenFile;
@@ -204,6 +226,11 @@ typedef struct _SFMC_BINDINGS {
     PFN_CB_NtQueryDirectoryFile OrigNtQueryDirectoryFile;
     PFN_CB_NtQueryDirectoryFileEx OrigNtQueryDirectoryFileEx;
     PFN_CB_NtDuplicateObject OrigNtDuplicateObject;
+    // PHASE18: NtWriteFile 的 Orig trampoline
+    PFN_CB_NtWriteFile OrigNtWriteFile;
+    // PHASE18 (第 18/19 个钩子): NtLockFile/NtUnlockFile 的 Orig trampoline
+    PFN_CB_NtLockFile OrigNtLockFile;
+    PFN_CB_NtUnlockFile OrigNtUnlockFile;
 } SFMC_BINDINGS, *PSFMC_BINDINGS;
 
 // ---------------------------------------------------------------------------
@@ -285,6 +312,24 @@ SFMC_API NTSTATUS NTAPI Stub_NtQueryDirectoryFileEx(HANDLE FileHandle, HANDLE Ev
 SFMC_API NTSTATUS NTAPI Stub_NtDuplicateObject(HANDLE SourceProcessHandle, HANDLE SourceHandle,
     HANDLE TargetProcessHandle, PHANDLE TargetHandle, ACCESS_MASK DesiredAccess,
     ULONG HandleAttributes, ULONG Options);
+
+// PHASE18: NtWriteFile 守卫 stub (第 17 个钩子)。只对假文件句柄进入托管
+// (托管侧按句柄 AccessMode 分流: 只读句柄回 ACCESS_DENIED); 其余走 Orig。
+SFMC_API NTSTATUS NTAPI Stub_NtWriteFile(HANDLE FileHandle, HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock,
+    PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key);
+
+// PHASE18 (第 18 个钩子): NtLockFile 守卫 stub —— tryLock 契约。只对假文件句柄进入托管
+// (托管侧授予锁); 真实句柄走 Orig。
+SFMC_API NTSTATUS NTAPI Stub_NtLockFile(HANDLE FileHandle, HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER ByteOffset, PLARGE_INTEGER Length, ULONG Key,
+    BOOLEAN FailImmediately, BOOLEAN ExclusiveLock);
+
+// PHASE18 (第 19 个钩子): NtUnlockFile 守卫 stub —— 解锁。只对假文件句柄进入托管。
+SFMC_API NTSTATUS NTAPI Stub_NtUnlockFile(HANDLE FileHandle,
+    PIO_STATUS_BLOCK IoStatusBlock, PLARGE_INTEGER ByteOffset,
+    PLARGE_INTEGER Length, ULONG Key);
 
 #ifdef __cplusplus
 }

@@ -216,6 +216,9 @@ SFMC_API void *SfmcGetExport(const char *name)
     if (strcmp(name, "Stub_NtQueryDirectoryFile") == 0)   return (void *)Stub_NtQueryDirectoryFile;
     if (strcmp(name, "Stub_NtQueryDirectoryFileEx") == 0) return (void *)Stub_NtQueryDirectoryFileEx;
     if (strcmp(name, "Stub_NtDuplicateObject") == 0)      return (void *)Stub_NtDuplicateObject;
+    if (strcmp(name, "Stub_NtWriteFile") == 0)            return (void *)Stub_NtWriteFile;
+    if (strcmp(name, "Stub_NtLockFile") == 0)             return (void *)Stub_NtLockFile;
+    if (strcmp(name, "Stub_NtUnlockFile") == 0)           return (void *)Stub_NtUnlockFile;
     return NULL;
 }
 
@@ -501,6 +504,65 @@ SFMC_API NTSTATUS NTAPI Stub_NtDuplicateObject(HANDLE SourceProcessHandle, HANDL
     IncrSuppressHooks();
     NTSTATUS st = s_bind.NtDuplicateObject(SourceProcessHandle, SourceHandle,
         TargetProcessHandle, TargetHandle, DesiredAccess, HandleAttributes, Options);
+    DecSuppressHooks();
+    return st;
+}
+
+// ---------------------------------------------------------------------------
+// PHASE18: NtWriteFile 守卫 stub (第 17 个钩子) —— natives 虚拟写 (Z:\cache\natives 可写区)。
+// JVM 提取链 (JNA jna.tmpdir / LWJGL SharedLibraryExtractPath / Netty workdir) 经
+// kernelbase WriteFile -> IAT 调本函数。只对假文件句柄 (0x5100xxxx) 进托管; 托管侧按
+// AccessMode 分流 (只读句柄回 ACCESS_DENIED, 可写 natives 句柄写入可变缓冲); 真实句柄 Orig。
+// ---------------------------------------------------------------------------
+SFMC_API NTSTATUS NTAPI Stub_NtWriteFile(HANDLE FileHandle, HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock,
+    PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key)
+{
+    if (IsSuppressHooks() > 0 || s_bind.NtWriteFile == NULL || !IsFakeFileHandle(FileHandle))
+    {
+        return s_bind.OrigNtWriteFile(FileHandle, Event, ApcRoutine, ApcContext,
+            IoStatusBlock, Buffer, Length, ByteOffset, Key);
+    }
+    IncrSuppressHooks();
+    NTSTATUS st = s_bind.NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext,
+        IoStatusBlock, Buffer, Length, ByteOffset, Key);
+    DecSuppressHooks();
+    return st;
+}
+
+// ---------------------------------------------------------------------------
+// PHASE18 (第 18/19 个钩子): NtLockFile/NtUnlockFile —— natives 虚拟锁 (tryLock 契约)。
+// NativeLibrariesBootstrap.tryLock (FileChannelImpl.tryLock) 在 FileKey.init 成功后调用
+// lock0 -> LockFile -> NtLockFile; 释放走 UnlockFile -> NtUnlockFile。只对假文件句柄进托管
+// (托管侧授予/释放锁, 空操作即正确); 真实句柄走 Orig。
+// ---------------------------------------------------------------------------
+SFMC_API NTSTATUS NTAPI Stub_NtLockFile(HANDLE FileHandle, HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER ByteOffset, PLARGE_INTEGER Length, ULONG Key,
+    BOOLEAN FailImmediately, BOOLEAN ExclusiveLock)
+{
+    if (IsSuppressHooks() > 0 || s_bind.NtLockFile == NULL || !IsFakeFileHandle(FileHandle))
+    {
+        return s_bind.OrigNtLockFile(FileHandle, Event, ApcRoutine, ApcContext,
+            IoStatusBlock, ByteOffset, Length, Key, FailImmediately, ExclusiveLock);
+    }
+    IncrSuppressHooks();
+    NTSTATUS st = s_bind.NtLockFile(FileHandle, Event, ApcRoutine, ApcContext,
+        IoStatusBlock, ByteOffset, Length, Key, FailImmediately, ExclusiveLock);
+    DecSuppressHooks();
+    return st;
+}
+
+SFMC_API NTSTATUS NTAPI Stub_NtUnlockFile(HANDLE FileHandle,
+    PIO_STATUS_BLOCK IoStatusBlock, PLARGE_INTEGER ByteOffset,
+    PLARGE_INTEGER Length, ULONG Key)
+{
+    if (IsSuppressHooks() > 0 || s_bind.NtUnlockFile == NULL || !IsFakeFileHandle(FileHandle))
+    {
+        return s_bind.OrigNtUnlockFile(FileHandle, IoStatusBlock, ByteOffset, Length, Key);
+    }
+    IncrSuppressHooks();
+    NTSTATUS st = s_bind.NtUnlockFile(FileHandle, IoStatusBlock, ByteOffset, Length, Key);
     DecSuppressHooks();
     return st;
 }
