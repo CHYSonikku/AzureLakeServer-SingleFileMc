@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="build/ZipPack/ZipPack.csproj" />
+  <Project Path="build/_build.csproj" />
+  <Project Path="SingleFileMc/SingleFileMc.csproj" />
+</Solution>

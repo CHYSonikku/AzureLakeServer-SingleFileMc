@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    MODIFIED: 2026-08-04 本地构建用 csproj(原 SharpDisasm.csproj 多目标 net35/net45/net4/netstandard2.0,
+    本机无法构建 .NET Framework 目标)。仅目标 netstandard2.0, 供 MinHook.NET.Local 引用。
+    源码/许可证头未改动(源自 spazzarama/SharpDisasm, MIT)。
+  -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <EnableDefaultItems>true</EnableDefaultItems>
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    MODIFIED: 2026-08-04 本地构建用 csproj(原 MinHook.NET.csproj 多目标 net45..net9.0, 本机无法构建
+    .NET Framework 目标)。源码为修改后的 MinHook.NET(新增 CreateHook(IntPtr, IntPtr) 原生 detour
+    重载, 见 HookEngine.cs 中 // MODIFIED: 2026-08-04 注释)。许可证: BSD 3-Clause (CCob 2022),
+    许可证全文保留于 third_party\Minhook.NET\LICENSE, 未改动。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <AssemblyName>MinHook.NET</AssemblyName>
+    <Version>1.1.2</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 排除 SharpDisasm 源码(由其自己的 Local.csproj 编译为独立程序集, 避免 CS0436 类型冲突) -->
+    <Compile Remove="SharpDisasm\**\*.cs" />
+    <ProjectReference Include="SharpDisasm\SharpDisasm.Local.csproj" />
+  </ItemGroup>
+
+</Project>

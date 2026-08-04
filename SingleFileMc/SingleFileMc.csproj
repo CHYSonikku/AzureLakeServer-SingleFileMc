@@ -1,0 +1,58 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <CETCompat>false</CETCompat>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- PHASE11-AOT: NativeAOT 单文件发布 (dotnet publish -c Release -r win-x64)。
+         运行时零 JIT + 纯原生单 exe(尾部 zip 无 .NET bundle 冲突)。
+         StripSymbols: 裁剪符号减小体积; StackTraceSupport: 保留异常堆栈;
+         InvariantGlobalization: 宿主无区域性敏感逻辑, 减小体积。 -->
+    <PublishAot>true</PublishAot>
+    <StripSymbols>true</StripSymbols>
+    <StackTraceSupport>true</StackTraceSupport>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Phase 3: MinHook.NET 由 NuGet 包改为本地修改后源码(新增 CreateHook(IntPtr, IntPtr)
+         原生 detour 重载; 许可证 BSD-3 保留于 third_party\Minhook.NET\LICENSE) -->
+    <ProjectReference Include="..\third_party\Minhook.NET\MinHook.NET\MinHook.NET.Local.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Phase 3: native 守卫 stub 库(shared, 测试模式)拷贝到输出目录供 NativeLibrary.Load。
+         PHASE11-AOT: AOT publish 时 sfmc_hooks_static.lib 静态链入 exe, 不拷贝 dll (零外部依赖);
+         JIT 测试模式 (dotnet publish -p:PublishAot=false) 保持原样。 -->
+    <None Include="..\native_hooks\build\sfmc_hooks_shared.dll" Link="sfmc_hooks_shared.dll"
+          CopyToOutputDirectory="PreserveNewest" Condition="'$(PublishAot)' != 'true'" />
+  </ItemGroup>
+
+  <!-- PHASE11-AOT: NativeAOT 静态链接 native 守卫库 (MS 官方方式, learn.microsoft.com/
+       dotnet/core/deploying/native-aot/interop):
+         - <NativeLibrary> 指向 .lib (win) -> AOT linker 将其链入 exe
+         - <DirectPInvoke Include="__Internal"> -> LibraryImport("__Internal") 生成直接调用,
+           符号由链接器从静态库解析 (运行时不再 LoadLibrary) -->
+  <ItemGroup Condition="'$(PublishAot)' == 'true'">
+    <DirectPInvoke Include="__Internal" />
+    <NativeLibrary Include="..\native_hooks\build\sfmc_hooks_static.lib" />
+  </ItemGroup>
+
+  <ItemGroup><!--
+    <EmbeddedResource Include="Minecraft/**/*">
+    </EmbeddedResource>
+    -->
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- JIT safety (S3a): compile everything once to its final optimized form; no background
+         tiered recompilation that could trigger JIT deep inside a hooked ntdll stack. -->
+    <RuntimeHostConfigurationOption Include="System.Runtime.TieredCompilation" Value="false" />
+    <RuntimeHostConfigurationOption Include="System.Runtime.TieredPGO" Value="false" />
+  </ItemGroup>
+
+</Project>

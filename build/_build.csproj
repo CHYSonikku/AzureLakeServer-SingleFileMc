@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>_build</RootNamespace>
+    <NoWarn>CS0649;CS0169;CA1416</NoWarn>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <NukeRootDirectory>..</NukeRootDirectory>
+    <NukeScriptDirectory>..</NukeScriptDirectory>
+    <NukeTelemetryVersion>1</NukeTelemetryVersion>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Nuke.Common" Version="10.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- NUKE 构建工程只编译自身的 Build.cs; build/ZipPack 是独立构建期工具, 不进编译项 -->
+    <Compile Remove="ZipPack\**\*.cs" />
+    <None Include="ZipPack\**" />
+  </ItemGroup>
+
+</Project>
